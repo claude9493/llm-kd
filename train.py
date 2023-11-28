@@ -10,14 +10,9 @@ from transformers import DataCollatorForSeq2Seq, Seq2SeqTrainer, Seq2SeqTraining
 from datasets import load_dataset, load_from_disk
 import deepspeed
 
-
-# os.environ["CUDA_VISIBLE_DEVICES"] = "4,5,6,7"
-# os.environ["WORLD_SIZE"] = "4"
-# os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
-
 DATA_PATH = Path("./data/samsum")
-MODEL_PATH = Path("../models/gpt2/base/")
-WORK_DIR = Path('results/samsum/gpt2-base-sft')
+MODEL_PATH = Path("../models/gpt2/xlarge/")
+WORK_DIR = Path('results/samsum/gpt2-xlarge-sft')
 
 dataset = load_from_disk(str(DATA_PATH))
 logger.debug(dataset)
@@ -42,7 +37,7 @@ tokenizer.pad_token_id = tokenizer.eos_token_id
 
 logger.debug(f"The padding token id is {tokenizer.pad_token_id}")
 
-CUTOFF_LEN = 256
+CUTOFF_LEN = 512
 LABEL_SPLIT = "Summary:\n"
 
 def generate_and_tokenize_prompt(instance, is_test=False):
@@ -70,16 +65,30 @@ def generate_and_tokenize_prompt(instance, is_test=False):
     if is_test:
         tokenized_user_prompt['_id'] = instance['id']
         return tokenized_user_prompt
+    
+    len_labels = len(tokenizer(instance['summary'])['input_ids'])
+    tokenized_full_prompt['is_label_complete'] = len(tokenized_full_prompt['labels'][user_prompt_len:]) >= len_labels
     return tokenized_full_prompt
 
-tokenized_dataset = dataset.map(generate_and_tokenize_prompt, num_proc=4) \
-                           .remove_columns(dataset['train'].column_names) \
-                           .with_format(type='torch')
+columns = ['input_ids', 'attention_mask', 'labels']
 
+train_data = dataset['train'].map(generate_and_tokenize_prompt, num_proc=1) \
+                             .filter(lambda instance: instance['is_label_complete']) \
+                             .select_columns(columns) \
+                             .with_format(type='torch')
+                           
+val_data = dataset['test'].map(generate_and_tokenize_prompt, num_proc=1) \
+                          .filter(lambda instance: instance['is_label_complete']) \
+                          .select_columns(columns) \
+                          .with_format(type='torch', columns=columns)
 
+logger.debug(f"Training data usage: {train_data.num_rows}/{dataset['train'].num_rows}.")
+logger.debug(f"Validation data usage: {val_data.num_rows}/{dataset['validation'].num_rows}.")                          
+                        
 model = AutoModelForCausalLM.from_pretrained(MODEL_PATH, 
                                              torch_dtype=torch.float16, 
-                                             load_in_8bit=False) 
+                                             load_in_8bit=False,
+                                             use_cache=False) 
 
 logger.debug(f"Number of parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 
@@ -92,13 +101,13 @@ data_collator = DataCollatorForSeq2Seq(
 )
 
 N_EPOCHS = 10
-LR = 5e-4  # base
-# LR = 5e-5  # xlarge
+# LR = 5e-4  # base
+LR = 5e-5  # xlarge
 
 PER_DEVICE_BATCH_SIZE = 2
 GRADIENT_ACCUMULATION_STEPS = 4
 N_GPUS = torch.cuda.device_count()
-TRAIN_LENGTH = len(tokenized_dataset['train'])
+TRAIN_LENGTH = len(train_data)
 N_STEPS = N_EPOCHS * TRAIN_LENGTH / (PER_DEVICE_BATCH_SIZE * N_GPUS)
 N_EVAL_PER_EPOCH =  2
 EVAL_STEPS = int(TRAIN_LENGTH / (PER_DEVICE_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS * N_GPUS) / N_EVAL_PER_EPOCH)
@@ -129,8 +138,8 @@ trainer = Seq2SeqTrainer(
     model=model,
     args=training_args,
     data_collator=data_collator,
-    train_dataset=tokenized_dataset['train'],
-    eval_dataset=tokenized_dataset['validation']
+    train_dataset=train_data,
+    eval_dataset=val_data
 )
 
 trainer.train()
