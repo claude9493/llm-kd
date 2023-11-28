@@ -1,12 +1,14 @@
 from copy import deepcopy
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
+from dataclasses import dataclass
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch.utils.data import Dataset
 
-from transformers import Seq2SeqTrainer
+from transformers import Seq2SeqTrainer, Seq2SeqTrainingArguments
 
 from transformers.trainer import (
     is_sagemaker_mp_enabled, 
@@ -30,12 +32,19 @@ if TYPE_CHECKING:
     from transformers.trainer_callback import TrainerCallback
     from transformers.trainer_utils import EvalPrediction, PredictionOutput
     from transformers.training_args import TrainingArguments
-    
+
+@dataclass
+class Seq2SeqKDArguments:
+    pass
+
+
 class Seq2SeqKDTrainer(Seq2SeqTrainer):
     def __init__(
         self,
         model: Union["PreTrainedModel", nn.Module] = None,
+        teacher_model: Union["PreTrainedModel", nn.Module] = None,
         args: "TrainingArguments" = None,
+        kd_args: "Seq2SeqKDArguments" = None,
         data_collator: Optional["DataCollator"] = None,
         train_dataset: Optional[Dataset] = None,
         eval_dataset: Optional[Union[Dataset, Dict[str, Dataset]]] = None,
@@ -61,8 +70,24 @@ class Seq2SeqKDTrainer(Seq2SeqTrainer):
         )
         
         # Load Teacher model
+        self.teacher_model = teacher_model
+        self.kd_args = kd_args
         
-    
+    def kd_loss(self, input, target, data):
+        loss_mask = torch.where(data['labels'] < 0, 0, 1).unsqueeze(-1)
+        def kld_loss(input, target, mask):
+            n_data = len(input)
+            # Not train on input
+            # unsqueeze for the convenience of later computations
+            kld = F.kl_div(input.log()*mask, target*mask, reduction="none")
+            # lambda input, target, mask: (F.kl_div(input.log()*mask, target*mask, reduction="none") / mask.sum(1, keepdim=True)).view(len(input),-1).sum(-1).mean()
+            return (kld/mask.sum(1, keepdim=True)).view(n_data,-1).sum(-1).mean()
+
+        if self.kd_args.reverse:
+            input, target = target, input
+            
+        return kld_loss(input, target, loss_mask)
+       
     def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
         """
         Perform a training step on a batch of inputs.
@@ -113,8 +138,10 @@ class Seq2SeqKDTrainer(Seq2SeqTrainer):
         if self.label_smoother is not None and "labels" in inputs:
             labels = inputs.pop("labels")
         else:
-            labels = None
+            labels = None  # Default case: no label smoothing
         outputs = model(**inputs)
+        
+        
         # Save past state if it exists
         # TODO: this needs to be fixed and made cleaner later.
         if self.args.past_index >= 0:
@@ -136,6 +163,12 @@ class Seq2SeqKDTrainer(Seq2SeqTrainer):
                     f"{','.join(outputs.keys())}. For reference, the inputs it received are {','.join(inputs.keys())}."
                 )
             # We don't use .loss here since the model may return tuples instead of ModelOutput.
-            loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+            loss_sft = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
 
+        # KD !!!
+        logits_t = self.teacher_model(**inputs)["logits"]
+        loss_kd = self.kd_loss(outputs["logits"], logits_t, inputs)
+        kd_ratio = self.kd_args.kd_ratio
+        loss = (1-kd_ratio)* loss_sft + kd_ratio * loss_kd
+        
         return (loss, outputs) if return_outputs else loss
