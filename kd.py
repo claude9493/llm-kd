@@ -6,7 +6,8 @@ from loguru import logger
 from pathlib import Path
 from transformers import AutoTokenizer
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, GenerationConfig
+from copy import deepcopy
+from transformers import AutoTokenizer, AutoModelForCausalLM, GenerationConfig, TrainerCallback
 from transformers import DataCollatorForSeq2Seq, Seq2SeqTrainer, Seq2SeqTrainingArguments
 from datasets import load_dataset, load_from_disk
 # import deepspeed
@@ -88,6 +89,20 @@ training_args = Seq2SeqTrainingArguments(
 )
 kd_args = Seq2SeqKDArguments()
 
+class CustomCallback(TrainerCallback):
+    
+    def __init__(self, trainer) -> None:
+        super().__init__()
+        self._trainer = trainer
+    
+    def on_step_end(self, args, state, control, **kwargs):
+        if control.should_log:
+            # control_copy = deepcopy(control)
+            self._trainer.log(self._trainer.loss_dict, metric_key_prefix="train")
+            # return control_copy
+        self._trainer.loss_dict = dict()
+
+
 trainer = Seq2SeqKDTrainer(
     model=model,
     teacher_model=teacher_model,
@@ -98,5 +113,7 @@ trainer = Seq2SeqKDTrainer(
     train_dataset=train_data,
     eval_dataset=val_data
 )
+trainer.add_callback(CustomCallback(trainer))
+
 logger.info("Start training!!!")
 trainer.train()

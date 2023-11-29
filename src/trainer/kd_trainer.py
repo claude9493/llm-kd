@@ -195,7 +195,7 @@ class Seq2SeqKDTrainer(Seq2SeqTrainer):
             loss_sft=loss_sft.mean().item(),
             loss_kd=loss_kd.mean().item()
         )
-        self.log(self.loss_dict)
+        # self.log(self.loss_dict)
         return (loss, outputs) if return_outputs else loss
     
     def compute_kd_loss(self, model, inputs, outputs=None):
