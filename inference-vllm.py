@@ -1,11 +1,12 @@
 # %% [markdown]
 # # Inference using vllm
-# CUDA_VISIBLE_DEVICES=7 python inference-vllm.py
+# CUDA_VISIBLE_DEVICES=7 python inference-vllm.py --model --tokenizer
 
 import json
 # %%
 import os
 import time
+from argparse import ArgumentParser
 from dataclasses import dataclass
 from pathlib import Path
 from timeit import default_timer as timer
@@ -17,11 +18,26 @@ import vllm
 from datasets import load_from_disk
 from loguru import logger
 from torch.utils.data import DataLoader
-from tqdm.notebook import tqdm
+from tqdm import tqdm
 from transformers import DataCollatorForSeq2Seq
 
 # %%
-SEED = 2023
+
+parser = ArgumentParser("LLM inference")
+# testing arguments
+parser.add_argument('-m', "--model", type=str, required=True)
+parser.add_argument('-t', "--tokenizer", type=str, required=True)
+parser.add_argument('-d', "--data", type=str, default="samsum")
+parser.add_argument("--seed", type=int, default=2023)
+# generation arguments
+parser.add_argument("--max-tokens", type=int, default=256)
+parser.add_argument("--top-k", type=int, default=-1)
+parser.add_argument("--top-p", type=float, default=1.0)
+parser.add_argument("--temperature", type=float, default=1.0)
+
+args = parser.parse_args()
+
+SEED = args.seed
 
 __import__('random').seed(SEED)
 __import__('numpy').random.seed(SEED)
@@ -30,10 +46,12 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 
 # %%
-DATA_PATH = Path("./data/samsum")
-MODEL_PATH = Path("./results/samsum/gpt2-xlarge-sft/checkpoint-4600/")
-TOKENIZER_PATH = Path("../models/gpt2/xlarge")
-WORK_DIR = Path('results/samsum/gpt2-xlarge-sft')
+DATA_PATH = dict(
+    samsum=Path("./data/samsum")
+)[args.data]
+MODEL_PATH = Path(args.model)  # Path("./results/samsum/gpt2-base-sft/checkpoint-8736/")
+TOKENIZER_PATH = Path(args.tokenizer)  # Path("../models/gpt2/base")
+WORK_DIR = Path(args.model)  # Path('results/samsum/gpt2-base-sft/checkpoint-8736/')
 
 # %%
 dataset = load_from_disk(str(DATA_PATH))
@@ -95,10 +113,10 @@ beam_search_params = vllm.SamplingParams(
 )
 
 sampling_params = vllm.SamplingParams(  # same as minillm
-    max_tokens=256,
-    top_k=-1,
-    top_p=1.0,
-    temperature=1.0,
+    max_tokens = args.max_tokens,  # 256,
+    top_k = args.top_k,  # -1,
+    top_p = args.top_p,  # 1.0,
+    temperature = args.temperature,  # 1.0,
 )
 
 # %%
