@@ -191,9 +191,9 @@ class Seq2SeqKDTrainer(Seq2SeqTrainer):
         kd_ratio = self.kd_args.kd_ratio
         loss = (1-kd_ratio)* loss_sft + kd_ratio * loss_kd
         self.loss_dict = dict(
-            loss=loss.mean().item(),
-            loss_sft=loss_sft.mean().item(),
-            loss_kd=loss_kd.mean().item()
+            loss=round(loss.mean().item(), 4),
+            loss_sft=round(loss_sft.mean().item(), 4),
+            loss_kd=round(loss_kd.mean().item(), 4)
         )
         # self.log(self.loss_dict)
         return (loss, outputs) if return_outputs else loss

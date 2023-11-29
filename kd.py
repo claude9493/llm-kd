@@ -98,7 +98,7 @@ class CustomCallback(TrainerCallback):
     def on_step_end(self, args, state, control, **kwargs):
         if control.should_log:
             # control_copy = deepcopy(control)
-            self._trainer.log(self._trainer.loss_dict, metric_key_prefix="train")
+            self._trainer.log(self._trainer.loss_dict)
             # return control_copy
         self._trainer.loss_dict = dict()
 
