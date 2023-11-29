@@ -11,8 +11,8 @@ from datasets import load_dataset, load_from_disk
 import deepspeed
 
 DATA_PATH = Path("./data/samsum")
-MODEL_PATH = Path("../models/gpt2/xlarge/")
-WORK_DIR = Path('results/samsum/gpt2-xlarge-sft')
+MODEL_PATH = Path("../models/gpt2/base/")
+WORK_DIR = Path('results/samsum/gpt2-base-sft')
 
 dataset = load_from_disk(str(DATA_PATH))
 logger.debug(dataset)
@@ -83,7 +83,7 @@ val_data = dataset['test'].map(generate_and_tokenize_prompt, num_proc=1) \
                           .with_format(type='torch', columns=columns)
 
 logger.debug(f"Training data usage: {train_data.num_rows}/{dataset['train'].num_rows}.")
-logger.debug(f"Validation data usage: {val_data.num_rows}/{dataset['validation'].num_rows}.")                          
+logger.debug(f"Validation data usage: {val_data.num_rows}/{dataset['validation'].num_rows}.")                     
                         
 model = AutoModelForCausalLM.from_pretrained(MODEL_PATH, 
                                              torch_dtype=torch.float16, 
@@ -100,18 +100,18 @@ data_collator = DataCollatorForSeq2Seq(
     pad_to_multiple_of=8
 )
 
-N_EPOCHS = 10
-# LR = 5e-4  # base
-LR = 5e-5  # xlarge
+N_EPOCHS = 20
+LR = 5e-4  # base
+# LR = 5e-5  # xlarge
 
 PER_DEVICE_BATCH_SIZE = 2
 GRADIENT_ACCUMULATION_STEPS = 4
-N_GPUS = torch.cuda.device_count()
-TRAIN_LENGTH = len(train_data)
-N_STEPS = N_EPOCHS * TRAIN_LENGTH / (PER_DEVICE_BATCH_SIZE * N_GPUS)
-N_EVAL_PER_EPOCH =  2
-EVAL_STEPS = int(TRAIN_LENGTH / (PER_DEVICE_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS * N_GPUS) / N_EVAL_PER_EPOCH)
-logger.debug(f"Evaluate per {EVAL_STEPS} steps")
+# N_GPUS = torch.cuda.device_count()
+# TRAIN_LENGTH = len(train_data)
+# N_STEPS = N_EPOCHS * TRAIN_LENGTH / (PER_DEVICE_BATCH_SIZE * N_GPUS)
+# N_EVAL_PER_EPOCH =  2
+# EVAL_STEPS = int(TRAIN_LENGTH / (PER_DEVICE_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS * N_GPUS) / N_EVAL_PER_EPOCH)
+# logger.debug(f"Evaluate per {EVAL_STEPS} steps")
 
 training_args = Seq2SeqTrainingArguments(
     output_dir=str(WORK_DIR),
@@ -123,13 +123,15 @@ training_args = Seq2SeqTrainingArguments(
     optim="adamw_torch",
     num_train_epochs=N_EPOCHS,
     gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
-    save_strategy="epoch",
+    save_strategy="steps",
     evaluation_strategy="steps",
-    eval_steps=EVAL_STEPS,
+    eval_steps=0.5/N_EPOCHS,
+    save_steps=0.5/N_EPOCHS,
     logging_dir=str(WORK_DIR/"logs"),
     logging_strategy="steps",
-    logging_steps=100,
-    save_total_limit=3,
+    logging_steps=0.05/N_EPOCHS,
+    save_total_limit=4,
+    load_best_model_at_end=True,
     report_to="tensorboard",
     deepspeed="ds_config/ds_config_zero1.json"
 )
