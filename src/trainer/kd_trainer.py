@@ -47,11 +47,19 @@ if TYPE_CHECKING:
     from transformers.trainer_utils import EvalPrediction, PredictionOutput
     from transformers.training_args import TrainingArguments
 
+def kld_loss(input, target, mask, reduction="none"):
+    # lambda input, target, mask: (F.kl_div(input.log()*mask, target*mask, reduction="none") / mask.sum(1, keepdim=True)).view(len(input),-1).sum(-1).mean()
+    kld = F.kl_div((input*mask).nan_to_num(0,0,0), (target*mask).nan_to_num(0,0,0), reduction="none")
+    if reduction == "mean":
+        return (kld / mask.sum(1, keepdim=True)).view(len(input),-1).nansum(-1).mean()
+    elif reduction == "none":
+        return kld
+
 @dataclass
 class Seq2SeqKDArguments:
     reverse_kld: bool = field(default=False, metadata={"help": "Whether to use reverse KL divergence."}) 
     kd_ratio: float = field(default=0.5, metadata={"help": "Weight for KD loss."}) 
-
+    kd_temperature: float = field(default=1.0, metadata={"help": "Teamperature for computing KL divergence."})
 
 class Seq2SeqKDTrainer(Seq2SeqTrainer):
     def __init__(
@@ -91,24 +99,7 @@ class Seq2SeqKDTrainer(Seq2SeqTrainer):
         self.kd_args = kd_args
         self.loss_dict = dict()
         
-    def kd_loss(self, input, target, data):
-        loss_mask = torch.where(((data['labels'] < 0) | (data['labels']==self.tokenizer.pad_token_id)), 0, 1).unsqueeze(-1)
-        def kld_loss(input, target, mask):
-            n_data = len(input)
-            # Not train on input
-            # unsqueeze for the convenience of later computations
-            kld = F.kl_div((input*mask).nan_to_num(0,0,0), (target*mask).nan_to_num(0,0,0), reduction="none")
-            # lambda input, target, mask: (F.kl_div(input.log()*mask, target*mask, reduction="none") / mask.sum(1, keepdim=True)).view(len(input),-1).sum(-1).mean()
-            return (kld/mask.sum(1, keepdim=True)).view(n_data,-1).nansum(-1).mean()
-        
-        if self.kd_args.reverse_kld:
-            input, target = target, input
-            
-        input = F.log_softmax(input, dim=-1)  # , dtype=torch.float32)
-        target = F.softmax(target, dim=-1)  # , dtype=torch.float32)
 
-        # __import__('ipdb').set_trace()
-        return kld_loss(input, target, loss_mask)
        
     def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
         """
@@ -200,13 +191,65 @@ class Seq2SeqKDTrainer(Seq2SeqTrainer):
     
     def compute_kd_loss(self, model, inputs, outputs=None):
         assert outputs, "Give me student model's outputs."
+        tmpt = self.kd_args.kd_temperature
+        # Train on output only, mask input and padding tokens.
+        loss_mask = torch.where(((inputs['labels'] < 0) | (inputs['labels']==self.tokenizer.pad_token_id)), 0, 1).unsqueeze(-1)        
         # KD !!!
         with torch.no_grad():
             logits_t = self.teacher_model(**inputs)["logits"]
-        loss_kd = self.kd_loss(outputs["logits"], logits_t, inputs)
+        input, target = outputs["logits"], logits_t
+        
+        if self.kd_args.reverse_kld:
+            input, target = target, input
+            
+        input = F.log_softmax(input/tmpt, dim=-1)  # , dtype=torch.float32)
+        target = F.softmax(target/tmpt, dim=-1)  # , dtype=torch.float32)
+        
+        loss_kd = kld_loss(input, target, loss_mask, reduction="mean") * tmpt**2
+
         # logger.debug(f"loss_kd: {loss_kd.item():.4f}")
         return loss_kd
     
-class LDKD(Seq2SeqKDTrainer):
-    def compute_loss(self, model, inputs, return_outputs=False):
-        pass
+
+@dataclass
+class Seq2SeqLDKDArguments(Seq2SeqKDArguments):
+    ldkd_alpha: float = field(default=1.0, metadata={"help":"Weight for top classes"})
+    ldkd_beta: float = field(default=1.0, metadata={"help":"Weight for remaining classes"})
+    ldkd_top_ratio: float = field(default=0.9, metadata={"help":"Top percentage."})
+
+class Seq2SeqLDKDTrainer(Seq2SeqKDTrainer):
+    
+    def compute_kd_loss(self, model, inputs, outputs=None):
+        assert outputs, "Give me student model's outputs."
+        tmpt = self.kd_args.kd_temperature
+        alpha, beta = self.kd_args.ldkd_alpha, self.kd_args.ldkd_beta
+        top_ratio = self.kd_args.ldkd_top_ratio
+        nv = outputs['logits'].shape[-1]  # Number of vocabolary
+        # Train on output only, mask input and padding tokens.
+        loss_mask = torch.where(((inputs['labels'] < 0) | (inputs['labels']==self.tokenizer.pad_token_id)), 0, 1).unsqueeze(-1)        
+        # KD !!!
+        with torch.no_grad():
+            logits_t = self.teacher_model(**inputs)["logits"]
+        
+        # Sort teacher logits and rearange/gather student logits accordingly. 
+        logits_t, idx = logits_t.sort(dim=-1, descending=True)
+        logits_s = torch.gather(outputs['logits'].view(-1, nv), 1, idx)
+        
+        top_mask = (torch.cumsum(F.softmax(logits_t, dim=-1), dim=-1) < top_ratio)
+        top_mask[:,1] = True
+        
+        input, target = logits_s, logits_t
+        if self.kd_args.reverse_kld:
+            input, target = target, input
+        input = F.log_softmax(input/tmpt, dim=-1)  # , dtype=torch.float32)
+        target = F.softmax(target/tmpt, dim=-1)  # , dtype=torch.float32)
+        kld = kld_loss(input, target, loss_mask, reduction="none") * tmpt**2
+        
+        __import__('ipdb').set_trace()
+        
+        top_kld = (kld * top_mask / loss_mask.sum(1, keepdim=True)).view(len(input),-1).nansum(-1).mean()
+        remain_kld = (kld * (~top_mask) / loss_mask.sum(1, keepdim=True)).view(len(input),-1).nansum(-1).mean()
+        
+        loss_kd = alpha * top_kld + beta * remain_kld
+        # logger.debug(f"loss_kd: {loss_kd.item():.4f}")
+        return loss_kd
