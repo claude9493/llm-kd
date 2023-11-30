@@ -3,31 +3,25 @@ from loguru import logger
 from pathlib import Path
 from functools import partial
 from datasets import load_dataset, load_from_disk
-from .base import DataInfo, generate_and_tokenize_prompt, columns
+from .base import generate_and_tokenize_prompt, columns, DataInfo
 
-# logger = logging.get_logger(__name__)
-NAME = "Samsum"
+NAME = "GSM8K"
 
-prompt_template = """[INST] <<SYS>>
-Use the Input to provide a summary of a conversation.
-<</SYS>>
+prompt_template = """Question:
+{question}
 
-Input:
-{dialogue}
-
-Summary:
-{summary}
+Answer:
+{answer}
 """
 
 info = DataInfo(
     name="GSM8K",
-    path=Path("./data/samsum"),
+    path=Path("./data/gsm8k"),
     prompt_template=prompt_template,
-    label_split="Summary:\n",
-    label_column="summary",
-    cutoff_len=512
+    label_split="Answer:\n",
+    label_column="answer",
+    cutoff_len=256
 )
-
 
 generate_and_tokenize_prompt = partial(generate_and_tokenize_prompt, info=info)
 
