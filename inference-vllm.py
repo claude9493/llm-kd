@@ -21,6 +21,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from transformers import DataCollatorForSeq2Seq
 
+from src.dataset import get_dataset
 # %%
 
 parser = ArgumentParser("LLM inference")
@@ -28,6 +29,7 @@ parser = ArgumentParser("LLM inference")
 parser.add_argument('-m', "--model", type=str, required=True)
 parser.add_argument('-t', "--tokenizer", type=str, required=True)
 parser.add_argument('-d', "--data", type=str, default="samsum")
+parser.add_argument('--metric', type=str, default='rouge',  choices=['rouge', 'accuracy'])
 parser.add_argument("--seed", type=int, default=2023)
 # generation arguments
 parser.add_argument("--max-tokens", type=int, default=256)
@@ -38,6 +40,7 @@ parser.add_argument("--temperature", type=float, default=1.0)
 args = parser.parse_args()
 
 SEED = args.seed
+evaluation_metric = args.metric
 
 __import__('random').seed(SEED)
 __import__('numpy').random.seed(SEED)
@@ -46,29 +49,33 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 
 # %%
-DATA_PATH = dict(
-    samsum=Path("./data/samsum")
-)[args.data]
 MODEL_PATH = Path(args.model)  # Path("./results/samsum/gpt2-base-sft/checkpoint-8736/")
 TOKENIZER_PATH = Path(args.tokenizer)  # Path("../models/gpt2/base")
 WORK_DIR = Path(args.model)  # Path('results/samsum/gpt2-base-sft/checkpoint-8736/')
 
+DATA_NAME = args.data
+_data_class = get_dataset(DATA_NAME)
+dataset = _data_class.dataset['test']
+
 # %%
-dataset = load_from_disk(str(DATA_PATH))
+# dataset = load_from_disk(str(DATA_PATH))
 logger.debug(dataset)
 
-prompt_template = """[INST] <<SYS>>
-Use the Input to provide a summary of a conversation.
-<</SYS>>
+# prompt_template = """[INST] <<SYS>>
+# Use the Input to provide a summary of a conversation.
+# <</SYS>>
 
-Input:
-{dialogue}
+# Input:
+# {dialogue}
 
-Summary:
-{summary}
-"""
-LABEL_SPLIT = "Summary:\n"
-logger.debug("Train data example:\n" + prompt_template.format(**dataset['train'][0]))
+# Summary:
+# {summary}
+# """
+# LABEL_SPLIT = "Summary:\n"
+label_column = _data_class.info.label_column
+prompt_template = _data_class.info.prompt_template
+LABEL_SPLIT = _data_class.info.label_split
+logger.debug("Test data example:\n" + prompt_template.format(**dataset[0]))
 
 # %%
 # model = AutoModelForCausalLM.from_pretrained(MODEL_PATH, load_in_8bit=False)
@@ -80,6 +87,9 @@ model = vllm.LLM(model=str(MODEL_PATH),
 tokenizer = model.get_tokenizer()
 tokenizer.padding_side = "left"
 tokenizer.pad_token_id = tokenizer.eos_token_id
+
+if 'id' not in dataset.column_names:
+    dataset = dataset.add_column('id', list(range(dataset.num_rows)))
 
 # %%
 @dataclass
@@ -99,7 +109,7 @@ data_collator = idCollator(
 )
 
 # %%
-dataloader = DataLoader(dataset['test'], collate_fn=data_collator, batch_size=64)
+dataloader = DataLoader(dataset, collate_fn=data_collator, batch_size=32)
 
 # %%
 beam_search_params = vllm.SamplingParams(
@@ -126,7 +136,7 @@ predictions = []
 start = timer()
 for it, (_ids, data) in tqdm(enumerate(dataloader)):
     results = model.generate(data, sampling_params, use_tqdm=False)
-    predictions.extend([{"id":_id, "summary": summary.strip()} for _id, summary in zip(_ids, [result.outputs[0].text for result in results])])
+    predictions.extend([{"id":_id, label_column: pred.strip()} for _id, pred in zip(_ids, [result.outputs[0].text for result in results])])
 
 end = timer()
 logger.info(f"Testing time: {end-start:.6f}s.")
@@ -142,15 +152,30 @@ with open(WORK_DIR/f"predictions-{suffix}.json", 'w') as f:
 # %%
 pred_ref = pd.merge(
     pd.DataFrame.from_records(predictions),
-    pd.DataFrame.from_records(dataset['test'], columns=['id', 'summary']),
+    pd.DataFrame.from_records(dataset, columns=['id', label_column]),
     on='id',
     how='inner',
     suffixes=['_pred', '_ref']
 )
 
+
 # %%
-rouge = evaluate.load("rouge")
-metrics = rouge.compute(predictions=pred_ref['summary_pred'], references=pred_ref['summary_ref'])
+if evaluation_metric == 'rouge':
+    rouge = evaluate.load("src/metrics/rouge")
+    metrics = rouge.compute(predictions=pred_ref[label_column+'_pred'], 
+                            references=pred_ref[label_column+'_ref'])
+elif evaluation_metric == 'accuracy':
+    acc = evaluate.load("src/metrics/accuracy")
+    def ans_parse(ans_str: str) -> int:
+        try:
+            ans = int(ans_str.split("####")[-1].strip().replace(',',''))
+        except Exception:
+            ans = -9999
+        return ans
+                
+    metrics = acc.compute(predictions=pred_ref[label_column+'_pred'].map(ans_parse), 
+                            references=pred_ref[label_column+'_ref'].map(ans_parse))
+
 logger.info(metrics)
 
 # %%
