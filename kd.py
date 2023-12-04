@@ -13,15 +13,16 @@ from datasets import load_dataset, load_from_disk
 # import deepspeed
 
 from src.trainer import Seq2SeqKDArguments, Seq2SeqKDTrainer
-from src.dataset import samsum
+from src.trainer import Seq2SeqLDKDArguments, Seq2SeqLDKDTrainer
+from src.dataset import get_dataset
 
-os.environ['CUDA_VISIBLE_DEVICES'] = "6"
+# os.environ['CUDA_VISIBLE_DEVICES'] = "6"
 
 # logger = logging.get_logger(__name__)
-
+DATA_NAME = "samsum"
 MODEL_PATH = Path("../models/gpt2/base/")
 TEACHER_MODEL_PATH = Path("results/samsum/gpt2-xlarge-sft/checkpoint-4256")
-WORK_DIR = Path("./results/samsum/gpt2-base-kd")  # Path('results/samsum/gpt2-base-sft')
+WORK_DIR = Path("./temp")  # Path("./results/samsum/gpt2-base-kd") 
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
 tokenizer.padding_side = "left"
@@ -29,9 +30,11 @@ tokenizer.pad_token_id = tokenizer.eos_token_id
 
 logger.debug(f"The padding token id is {tokenizer.pad_token_id}")
 
-train_data = samsum.get_train(tokenizer)
-val_data = samsum.get_val(tokenizer)
-                        
+
+_data_class = get_dataset(DATA_NAME)
+train_data = _data_class.get_train(tokenizer)
+val_data = _data_class.get_val(tokenizer)
+
 model = AutoModelForCausalLM.from_pretrained(MODEL_PATH, 
                                              torch_dtype=torch.float16, 
                                              load_in_8bit=False,
@@ -58,7 +61,7 @@ N_EPOCHS = 20
 LR = 5e-4  # base
 # LR = 1e-7  # Debug
 # LR = 5e-5  # xlarge
-
+BATCH_SIZE = 32  # 4*4*2
 PER_DEVICE_BATCH_SIZE = 4
 GRADIENT_ACCUMULATION_STEPS = 4
 
@@ -68,7 +71,8 @@ training_args = Seq2SeqTrainingArguments(
     per_device_eval_batch_size=PER_DEVICE_BATCH_SIZE,
     learning_rate=LR,
     lr_scheduler_type="cosine",
-    fp16=True,
+    # fp16=True,
+    bf16=True,
     warmup_steps=100,
     weight_decay=1e-2,
     optim="adamw_torch",
@@ -87,7 +91,12 @@ training_args = Seq2SeqTrainingArguments(
     report_to="tensorboard",
     deepspeed="ds_config/ds_config_zero1.json"
 )
-kd_args = Seq2SeqKDArguments()
+kd_args = Seq2SeqLDKDArguments(
+    ldkd_alpha=1,
+    ldkd_beta=2,
+    ldkd_top_ratio=0.99,
+    kd_temperature=2.5
+)
 
 class CustomCallback(TrainerCallback):
     
@@ -97,13 +106,11 @@ class CustomCallback(TrainerCallback):
     
     def on_step_end(self, args, state, control, **kwargs):
         if control.should_log:
-            # control_copy = deepcopy(control)
             self._trainer.log(self._trainer.loss_dict)
-            # return control_copy
         self._trainer.loss_dict = dict()
 
 
-trainer = Seq2SeqKDTrainer(
+trainer = Seq2SeqLDKDTrainer(
     model=model,
     teacher_model=teacher_model,
     tokenizer=tokenizer,
