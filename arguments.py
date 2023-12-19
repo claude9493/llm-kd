@@ -26,9 +26,8 @@ class ModelArguments:
     tokenizer_name: Optional[str] = field(
         default=None, metadata={"help": "Pretrained tokenizer name or path if not the same as model_name"}
     )
-    use_fast_tokenizer: bool = field(
-        default=True,
-        metadata={"help": "Whether to use one of the fast tokenizer (backed by the tokenizers library) or not."},
+    tokenizer_kwargs: Optional[dict] = field(
+        default=None, metadata={"help": "Kwargs for AutoTokenizer.from_pretrained()"}
     )
     torch_dtype: Optional[str] = field(
         default=None,
@@ -55,6 +54,13 @@ class ModelArguments:
             "help": "Resume training from specified checkpoint."
         }
     )
+    
+    lora_config: Optional[dict] = field(
+        default=None,
+        metadata={
+            "help": "Config for the LoRA."
+        }
+    )
     # def __post_init__(self):
     #     if self.config_overrides is not None and (self.config_name is not None or self.model_name_or_path is not None):
     #         raise ValueError(
@@ -67,25 +73,31 @@ class DataArguments:
     dataset_name: Optional[str] = field(
         default=None, metadata={
             "help": "The name of the dataset to use (via the src.dataset).",
-            "choice": ["dolly","samsum","gmk8k"]
+            "choices": ["dolly","samsum","gmk8k"]
         }
     )
 
 @dataclass
 class KDArguments:
-    type: str = field(
+    kd_type: str = field(
         default=None, metadata={
             "help": "Type of the KD trainer.",
-            "choice": list(KD_TYPE_DICT.keys())
+            "choices": list(KD_TYPE_DICT.keys())
         }
     )
-    args: dict = field(
+    teacher_model_path: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Path to the teacher model checkpoint."
+        }
+    )
+    kd_args: Optional[dict] = field(
         default=None, metadata={"help": "Key-value pairs of the KD arguments."}
     )
     
     def __post_init__(self):
-        if self.type == None:
+        if self.kd_type == None:
             return
-        self.type = self.type.lower()
-        assert self.type in KD_TYPE_DICT.keys(), f"Unknown KD trainer type {self.type}."
-        self.args = KD_TYPE_DICT[self.type].parse_dict(self.args)
+        self.kd_type = self.kd_type.lower()
+        assert self.kd_type in KD_TYPE_DICT.keys(), f"Unknown KD trainer type {self.kd_type}."
+        self.kd_args = KD_TYPE_DICT[self.kd_type](**self.kd_args)

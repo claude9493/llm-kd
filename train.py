@@ -9,7 +9,7 @@ from transformers import HfArgumentParser
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers import DataCollatorForSeq2Seq, Seq2SeqTrainer, Seq2SeqTrainingArguments
 from src.dataset import get_dataset
-
+from src.utils.archive import ArchiveScriptCallback
 from arguments import ModelArguments, DataArguments
 
 parser = HfArgumentParser((ModelArguments, DataArguments, Seq2SeqTrainingArguments))
@@ -23,7 +23,6 @@ else:
 
 # Handle arguments
 MODEL_PATH = model_args.model_name_or_path
-
 WORK_DIR = Path('results')/data_args.dataset_name/training_args.output_dir
 training_args.output_dir = str(WORK_DIR)
 
@@ -56,14 +55,14 @@ logger.debug(f"Number of parameters: {sum(p.numel() for p in model.parameters() 
 if model_args.lora_config is not None:
     from peft import get_peft_model, LoraConfig, prepare_model_for_kbit_training
     from src.utils import find_all_linear_names
-    target_modules = find_all_linear_names(model)
-    target_modules = ["q_proj", "k_proj", "v_proj"]
-    logger.debug(f"Lora target modules: {target_modules}")
-    lora_config = LoraConfig(**model_args.lora_config, 
-                             target_modules=target_modules)
+    lora_config = LoraConfig(**model_args.lora_config)
+    if lora_config.target_modules == "all":
+        lora_config.target_modules = find_all_linear_names(model)
+    logger.debug(f"Lora target modules: {lora_config.target_modules}")
     model = get_peft_model(prepare_model_for_kbit_training(model), lora_config)
-    model.print_trainable_parameters()
-    # model.train()
+    trainable_params, all_param = model.get_nb_trainable_parameters()
+    logger.debug(f"trainable params: {trainable_params:,d} || all params: {all_param:,d} || trainable%: {100 * trainable_params / all_param}")
+
 # Data collator
 data_collator = DataCollatorForSeq2Seq(
     tokenizer,
@@ -79,14 +78,27 @@ training_args.save_steps /= training_args.num_train_epochs
 training_args.logging_steps /= training_args.num_train_epochs
 training_args.label_names = ['labels']
 
+def compute_metrics(pred):
+    # To-Do: generate and compute rougeL during evaluation
+    pred_ids = pred.predictions
+    label_ids = pred.label_ids
+    pass
+
+archive_script_callback = ArchiveScriptCallback(
+    training_args.output_dir, 
+    config_file=os.path.abspath(sys.argv[-1]) if sys.argv[-1].endswith(".yaml") else None
+)
+
 trainer = Seq2SeqTrainer(
     model=model,
     args=training_args,
     data_collator=data_collator,
     train_dataset=train_data,
-    eval_dataset=val_data
+    eval_dataset=val_data,
+    callbacks=[archive_script_callback]
 )
 
+logger.debug(f"Trainer callbacks:{trainer.callback_handler.callback_list}")
 # __import__('ipdb').set_trace()
 logger.debug("Start Training!!!")
 trainer.train(resume_from_checkpoint=model_args.checkpoint)
