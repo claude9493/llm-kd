@@ -18,7 +18,7 @@ def generate_and_tokenize_prompt(instance, tokenizer, info, is_test=False):
             prompt,
             truncation=True,
             max_length=info.cutoff_len,
-            padding=True,
+            padding=True,  # "longest",
             return_tensors=None
         )
         if(

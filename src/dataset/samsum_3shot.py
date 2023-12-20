@@ -7,10 +7,32 @@ from datasets import load_dataset, load_from_disk
 from .base import DataInfo, generate_and_tokenize_prompt, columns
 
 # logger = logging.get_logger(__name__)
-NAME = "Samsum"
+NAME = "Samsum-3shot"
 
 prompt_template = """[INST] <<SYS>>
-Use the Input to provide a summary of a conversation.
+Use the Input to provide a summary of a conversation. For example,
+----------
+Input:
+Amanda: I baked cookies. Do you want some? 
+Jerry: Sure! 
+Amanda: I'll bring you tomorrow :-)	
+
+Summary: Amanda baked cookies and will bring Jerry some tomorrow.
+----------
+Input:
+Sam: I'm so sorry. I can't make it on time. 
+Sandra: Should we start without you? 
+Sam: Please do. I'll be 30 min late. 
+Staś: Ok	
+
+Summary: Sam will be 30 minutes late. Sandra and Staś will start without Sam.
+----------
+Input:
+Mark: I just shipped the goods Mark: Tomorrow I'll send you the tracking number 
+George: Thanks!	
+
+Summary: Mark just shipped the goods and he will send George the tracking number tomorrow.
+----------
 <</SYS>>
 
 Input:
@@ -21,12 +43,12 @@ Summary:
 """
 
 info = DataInfo(
-    name="Samsum",
+    name="Samsum-3shot",
     path=Path("./data/samsum"),
     prompt_template=prompt_template,
     label_split="Summary:\n",
     label_column="summary",
-    cutoff_len=512
+    cutoff_len=768
 )
 
 
@@ -35,14 +57,6 @@ generate_and_tokenize_prompt = partial(generate_and_tokenize_prompt, info=info)
 dataset = load_from_disk(info.path)
 logger.debug(f"Dataset: {dataset}")
 
-def get_train(tokenizer):
-    train_data = dataset['train'].map(partial(generate_and_tokenize_prompt, tokenizer=tokenizer), num_proc=1) \
-                             .filter(lambda instance: instance['is_label_complete']) \
-                             .select_columns(columns) \
-                             .with_format(type='torch')
-    logger.debug("Train data example:\n" + prompt_template.format(**dataset['train'][0]))
-    logger.debug(f"Training data usage: {train_data.num_rows}/{dataset['train'].num_rows}.")
-    return train_data
 
 def get_val(tokenizer):
     val_data = dataset['validation'].map(partial(generate_and_tokenize_prompt, tokenizer=tokenizer), num_proc=1) \
