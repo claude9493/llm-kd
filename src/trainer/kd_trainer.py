@@ -1,14 +1,12 @@
-from copy import deepcopy
-from pathlib import Path
+from loguru import logger
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
-from dataclasses import dataclass, field
 
 import torch
 from torch import nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 
-from transformers import Seq2SeqTrainer, Seq2SeqTrainingArguments
+from transformers import Seq2SeqTrainer, TrainerCallback
 
 from transformers.trainer import (
     is_sagemaker_mp_enabled, 
@@ -18,9 +16,8 @@ from transformers.trainer import (
     MODEL_FOR_CAUSAL_LM_MAPPING_NAMES,
 )
 
-# from transformers.utils import logging
-# logger = logging.get_logger(__name__)
-from loguru import logger
+from .kd_arguments import *
+
 
 if is_apex_available():
     from apex import amp
@@ -55,11 +52,18 @@ def kld_loss(input, target, mask, reduction="none"):
     elif reduction == "none":
         return kld
 
-@dataclass
-class Seq2SeqKDArguments:
-    reverse_kld: bool = field(default=False, metadata={"help": "Whether to use reverse KL divergence."}) 
-    kd_ratio: float = field(default=0.5, metadata={"help": "Weight for KD loss."}) 
-    kd_temperature: float = field(default=1.0, metadata={"help": "Teamperature for computing KL divergence."})
+class KDLoggingCallback(TrainerCallback):
+    
+    def __init__(self, trainer) -> None:
+        super().__init__()
+        self._trainer = trainer
+    
+    def on_step_end(self, args, state, control, **kwargs):
+        if control.should_log:
+            self._trainer.log(self._trainer.loss_dict)
+        self._trainer.loss_dict = dict()
+
+
 
 class Seq2SeqKDTrainer(Seq2SeqTrainer):
     def __init__(
@@ -211,11 +215,7 @@ class Seq2SeqKDTrainer(Seq2SeqTrainer):
         return loss_kd
     
 
-@dataclass
-class Seq2SeqLDKDArguments(Seq2SeqKDArguments):
-    ldkd_alpha: float = field(default=1.0, metadata={"help":"Weight for top classes"})
-    ldkd_beta: float = field(default=1.0, metadata={"help":"Weight for remaining classes"})
-    ldkd_top_ratio: float = field(default=0.9, metadata={"help":"Top percentage."})
+
 
 class Seq2SeqLDKDTrainer(Seq2SeqKDTrainer):
     
@@ -232,8 +232,9 @@ class Seq2SeqLDKDTrainer(Seq2SeqKDTrainer):
             logits_t = self.teacher_model(**inputs)["logits"]
         
         # Sort teacher logits and rearange/gather student logits accordingly. 
-        logits_t, idx = logits_t.sort(dim=-1, descending=True)
-        logits_s = torch.gather(outputs['logits'].view(-1, nv), 1, idx)
+        logits_t, idx = logits_t.sort(dim=-1, descending=True)                
+        # logits_s = torch.gather(outputs['logits'].view(-1,nv), 1, idx.view(-1,nv)).view(*logits_t.shape)
+        logits_s = torch.gather(outputs['logits'], 2, idx)
         
         top_mask = (torch.cumsum(F.softmax(logits_t, dim=-1), dim=-1) < top_ratio)
         top_mask[:,1] = True
@@ -245,11 +246,9 @@ class Seq2SeqLDKDTrainer(Seq2SeqKDTrainer):
         target = F.softmax(target/tmpt, dim=-1)  # , dtype=torch.float32)
         kld = kld_loss(input, target, loss_mask, reduction="none") * tmpt**2
         
-        __import__('ipdb').set_trace()
         
         top_kld = (kld * top_mask / loss_mask.sum(1, keepdim=True)).view(len(input),-1).nansum(-1).mean()
         remain_kld = (kld * (~top_mask) / loss_mask.sum(1, keepdim=True)).view(len(input),-1).nansum(-1).mean()
         
         loss_kd = alpha * top_kld + beta * remain_kld
-        # logger.debug(f"loss_kd: {loss_kd.item():.4f}")
         return loss_kd

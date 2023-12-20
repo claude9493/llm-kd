@@ -1,28 +1,47 @@
 # NCCL_P2P_DISABLE=1 deepspeed --include localhost:6,7 kd.py
 
 import os
+import sys
 # from transformers.utils import logging
 from loguru import logger
 from pathlib import Path
-from transformers import AutoTokenizer
 import torch
 from copy import deepcopy
-from transformers import AutoTokenizer, AutoModelForCausalLM, GenerationConfig, TrainerCallback
-from transformers import DataCollatorForSeq2Seq, Seq2SeqTrainer, Seq2SeqTrainingArguments
-from datasets import load_dataset, load_from_disk
-# import deepspeed
+from transformers import HfArgumentParser
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import DataCollatorForSeq2Seq, Seq2SeqTrainingArguments
+import deepspeed
 
-from src.trainer import Seq2SeqKDArguments, Seq2SeqKDTrainer
-from src.trainer import Seq2SeqLDKDArguments, Seq2SeqLDKDTrainer
+from src.trainer import Seq2SeqKDTrainer, Seq2SeqLDKDTrainer, KDLoggingCallback
+from arguments import ModelArguments, DataArguments, KDArguments
 from src.dataset import get_dataset
+from src.utils.archive import ArchiveScriptCallback
 
 # os.environ['CUDA_VISIBLE_DEVICES'] = "6"
 
+
+parser = HfArgumentParser((ModelArguments, DataArguments, Seq2SeqTrainingArguments, KDArguments))
+
+print(sys.argv)
+
+# if len(sys.argv) == 2 and sys.argv[1].endswith(".yaml"):
+if sys.argv[-1].endswith(".yaml"):  # [-1] in case deepspeed is used
+    model_args, data_args, training_args, kd_args = parser.parse_yaml_file(
+        yaml_file=os.path.abspath(sys.argv[-1]), 
+        allow_extra_keys=False)
+else:
+    model_args, data_args, training_args, kd_args = parser.parse_args_into_dataclasses()
+
+# Handle arguments
+MODEL_PATH = model_args.model_name_or_path
+WORK_DIR = Path('results')/data_args.dataset_name/training_args.output_dir
+training_args.output_dir = str(WORK_DIR)
+training_args.logging_dir = str(WORK_DIR/__import__('transformers').training_args.default_logdir())
+
 # logger = logging.get_logger(__name__)
-DATA_NAME = "samsum"
-MODEL_PATH = Path("../models/gpt2/base/")
-TEACHER_MODEL_PATH = Path("results/samsum/gpt2-xlarge-sft/checkpoint-4256")
-WORK_DIR = Path("./temp")  # Path("./results/samsum/gpt2-base-kd") 
+# DATA_NAME = "samsum"
+# MODEL_PATH = Path("../models/gpt2/base/")
+# TEACHER_MODEL_PATH = Path("results/samsum/gpt2-xlarge-sft/checkpoint-4256")
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
 tokenizer.padding_side = "left"
@@ -30,24 +49,51 @@ tokenizer.pad_token_id = tokenizer.eos_token_id
 
 logger.debug(f"The padding token id is {tokenizer.pad_token_id}")
 
+# __import__('ipdb').set_trace()
 
-_data_class = get_dataset(DATA_NAME)
+_data_class = get_dataset(data_args.dataset_name)
 train_data = _data_class.get_train(tokenizer)
 val_data = _data_class.get_val(tokenizer)
 
-model = AutoModelForCausalLM.from_pretrained(MODEL_PATH, 
-                                             torch_dtype=torch.float16, 
-                                             load_in_8bit=False,
-                                             use_cache=False) 
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_PATH, torch_dtype=torch.float16, load_in_8bit=False, use_cache=False
+)
 
-teacher_model = AutoModelForCausalLM.from_pretrained(TEACHER_MODEL_PATH,
-                                                     torch_dtype=torch.float16,
-                                                     load_in_8bit=False,
-                                                     use_cache=False)
+teacher_model = AutoModelForCausalLM.from_pretrained(
+    kd_args.teacher_model_path,
+    torch_dtype=torch.float16,
+    load_in_8bit=False,
+    use_cache=False,
+)
 teacher_model.eval()
+
+# kd_args = kd_args.kd_args  # stupid but necessary
 
 logger.debug(f"Student model #Params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 logger.debug(f"Teacher model #Params: {sum(p.numel() for p in teacher_model.parameters() if p.requires_grad):,}")
+
+# from deepspeed.inference.config import DeepSpeedInferenceConfig, DeepSpeedTPConfig
+
+# ds_inference_cfg = DeepSpeedInferenceConfig(
+#     tensor_parallel = DeepSpeedTPConfig(
+#         tp_size=torch.cuda.device_count()
+#     )
+# )
+
+ds_inference_cfg = dict(
+    tensor_parallel = dict(
+        tp_size=torch.cuda.device_count()
+    )
+)
+
+
+deepspeed.init_inference(teacher_model, 
+                         config=ds_inference_cfg)
+
+logger.debug(f"[RANK {os.environ['LOCAL_RANK']}] Teacher model device: {teacher_model.device}")
+logger.debug(f"[RANK {os.environ['LOCAL_RANK']}] Teacher model forward propagation test: {teacher_model(**train_data[0])}")
+
+# __import__('ipdb').set_trace()
 
 data_collator = DataCollatorForSeq2Seq(
     tokenizer,
@@ -57,70 +103,20 @@ data_collator = DataCollatorForSeq2Seq(
     pad_to_multiple_of=8
 )
 
-N_EPOCHS = 20
-LR = 5e-4  # base
-# LR = 1e-7  # Debug
-# LR = 5e-5  # xlarge
-BATCH_SIZE = 32  # 4*4*2
-PER_DEVICE_BATCH_SIZE = 4
-GRADIENT_ACCUMULATION_STEPS = 4
-
-training_args = Seq2SeqTrainingArguments(
-    output_dir=str(WORK_DIR),
-    per_device_train_batch_size=PER_DEVICE_BATCH_SIZE,
-    per_device_eval_batch_size=PER_DEVICE_BATCH_SIZE,
-    learning_rate=LR,
-    lr_scheduler_type="cosine",
-    # fp16=True,
-    bf16=True,
-    warmup_steps=100,
-    weight_decay=1e-2,
-    optim="adamw_torch",
-    adam_epsilon=1e-3,  # thanks to https://zhuanlan.zhihu.com/p/507889212
-    num_train_epochs=N_EPOCHS,
-    gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
-    save_strategy="steps",
-    evaluation_strategy="steps",
-    eval_steps=0.5/N_EPOCHS,
-    save_steps=0.5/N_EPOCHS,
-    logging_strategy="steps",
-    logging_steps=0.05/N_EPOCHS,
-    logging_dir=str(WORK_DIR/"logs"),
-    save_total_limit=3,
-    load_best_model_at_end=True,
-    report_to="tensorboard",
-    deepspeed="ds_config/ds_config_zero1.json"
-)
-kd_args = Seq2SeqLDKDArguments(
-    ldkd_alpha=1,
-    ldkd_beta=2,
-    ldkd_top_ratio=0.99,
-    kd_temperature=2.5
-)
-
-class CustomCallback(TrainerCallback):
-    
-    def __init__(self, trainer) -> None:
-        super().__init__()
-        self._trainer = trainer
-    
-    def on_step_end(self, args, state, control, **kwargs):
-        if control.should_log:
-            self._trainer.log(self._trainer.loss_dict)
-        self._trainer.loss_dict = dict()
-
 
 trainer = Seq2SeqLDKDTrainer(
     model=model,
     teacher_model=teacher_model,
     tokenizer=tokenizer,
     args=training_args,
-    kd_args=kd_args,
+    kd_args=kd_args.kd_args,
     data_collator=data_collator,
     train_dataset=train_data,
     eval_dataset=val_data
 )
-trainer.add_callback(CustomCallback(trainer))
+
+trainer.add_callback(KDLoggingCallback(trainer))
+trainer.add_callback(ArchiveScriptCallback(training_args.output_dir))
 
 logger.info("Start training!!!")
-trainer.train()
+trainer.train(resume_from_checkpoint=model_args.checkpoint)
