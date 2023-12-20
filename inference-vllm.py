@@ -1,6 +1,8 @@
 # %% [markdown]
 # # Inference using vllm
 # CUDA_VISIBLE_DEVICES=7 python inference-vllm.py --model --tokenizer
+# CUDA_VISIBLE_DEVICES=6 python inference-vllm.py -m results/gsm8k/gpt2-base-sft/checkpoint-4290 -t ../models/gpt2/base/ -d gsm8k --metric accuracy
+
 
 import json
 # %%
@@ -27,8 +29,9 @@ from src.dataset import get_dataset
 parser = ArgumentParser("LLM inference")
 # testing arguments
 parser.add_argument('-m', "--model", type=str, required=True)
-parser.add_argument('-t', "--tokenizer", type=str, required=True)
+parser.add_argument('-t', "--tokenizer", type=str, default=None)
 parser.add_argument('-d', "--data", type=str, default="samsum")
+parser.add_argument('--lora', type=str, default=None)
 parser.add_argument('--metric', type=str, default='rouge',  choices=['rouge', 'accuracy'])
 parser.add_argument("--seed", type=int, default=2023)
 # generation arguments
@@ -50,8 +53,8 @@ if torch.cuda.is_available():
 
 # %%
 MODEL_PATH = Path(args.model)  # Path("./results/samsum/gpt2-base-sft/checkpoint-8736/")
-TOKENIZER_PATH = Path(args.tokenizer)  # Path("../models/gpt2/base")
-WORK_DIR = Path(args.model)  # Path('results/samsum/gpt2-base-sft/checkpoint-8736/')
+TOKENIZER_PATH = Path(args.tokenizer) if args.tokenizer else MODEL_PATH # Path("../models/gpt2/base")
+WORK_DIR = Path(args.lora) if args.lora else Path(args.model)  # Path('results/samsum/gpt2-base-sft/checkpoint-8736/')
 
 DATA_NAME = args.data
 _data_class = get_dataset(DATA_NAME)
@@ -83,6 +86,15 @@ model = vllm.LLM(model=str(MODEL_PATH),
                  tokenizer=str(TOKENIZER_PATH),
                  seed=SEED)
 
+if args.lora:
+    from src.utils import lora_merge_unmerge_state_dict
+    from safetensors.torch import save_file, load_file
+    from peft.config import PeftConfig
+    lora_state_dict = load_file(os.path.join(args.lora, "adapter_model.safetensors"))
+    peft_config = PeftConfig.from_pretrained(args.lora)
+    lora_merge_unmerge_state_dict(model, lora_state_dict, peft_config, merge=True)
+    logger.debug("LoRA adapter merged.")
+
 # %%
 tokenizer = model.get_tokenizer()
 tokenizer.padding_side = "left"
@@ -109,7 +121,7 @@ data_collator = idCollator(
 )
 
 # %%
-dataloader = DataLoader(dataset, collate_fn=data_collator, batch_size=32)
+dataloader = DataLoader(dataset, collate_fn=data_collator, batch_size=8)
 
 # %%
 beam_search_params = vllm.SamplingParams(
@@ -134,7 +146,7 @@ torch.cuda.empty_cache()
 predictions = []
 
 start = timer()
-for it, (_ids, data) in tqdm(enumerate(dataloader)):
+for it, (_ids, data) in tqdm(enumerate(dataloader), total=len(dataloader)):
     results = model.generate(data, sampling_params, use_tqdm=False)
     predictions.extend([{"id":_id, label_column: pred.strip()} for _id, pred in zip(_ids, [result.outputs[0].text for result in results])])
 
