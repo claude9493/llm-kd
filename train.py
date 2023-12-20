@@ -15,8 +15,15 @@ from arguments import ModelArguments, DataArguments
 parser = HfArgumentParser((ModelArguments, DataArguments, Seq2SeqTrainingArguments))
 
 # if len(sys.argv) == 2 and sys.argv[1].endswith(".yaml"):
-if sys.argv[-1].endswith(".yaml"):
-    model_args, data_args, training_args = parser.parse_yaml_file(yaml_file=os.path.abspath(sys.argv[-1]), allow_extra_keys=False)
+print(sys.argv)
+config_file = None
+for _arg in sys.argv:
+    if _arg.endswith(".yaml") and _arg.startswith("configs"):
+        config_file = os.path.abspath(_arg)
+        break
+# if sys.argv[-1].endswith(".yaml"):
+if config_file:
+    model_args, data_args, training_args = parser.parse_yaml_file(yaml_file=config_file, allow_extra_keys=False)
     logger.debug(f"Config file: {os.path.abspath(sys.argv[-1])}")
 else:
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
@@ -25,6 +32,7 @@ else:
 MODEL_PATH = model_args.model_name_or_path
 WORK_DIR = Path('results')/data_args.dataset_name/training_args.output_dir
 training_args.output_dir = str(WORK_DIR)
+training_args.logging_dir = str(WORK_DIR/__import__('transformers').training_args.default_logdir())
 
 # Load tokenizer
 tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, **model_args.tokenizer_kwargs)
@@ -48,9 +56,12 @@ torch_dtype = (
 model = AutoModelForCausalLM.from_pretrained(MODEL_PATH, 
                                              torch_dtype=torch_dtype, 
                                              load_in_8bit=False,
-                                             use_cache=False) 
+                                             use_cache=False)
+
 
 logger.debug(f"Number of parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+
+# model = __import__('tensor_parallel').tensor_parallel(model)  # , ["cuda:0", "cuda:1"])
 
 if model_args.lora_config is not None:
     from peft import get_peft_model, LoraConfig, prepare_model_for_kbit_training
@@ -62,6 +73,7 @@ if model_args.lora_config is not None:
     model = get_peft_model(prepare_model_for_kbit_training(model), lora_config)
     trainable_params, all_param = model.get_nb_trainable_parameters()
     logger.debug(f"trainable params: {trainable_params:,d} || all params: {all_param:,d} || trainable%: {100 * trainable_params / all_param}")
+
 
 # Data collator
 data_collator = DataCollatorForSeq2Seq(
@@ -86,7 +98,7 @@ def compute_metrics(pred):
 
 archive_script_callback = ArchiveScriptCallback(
     training_args.output_dir, 
-    config_file=os.path.abspath(sys.argv[-1]) if sys.argv[-1].endswith(".yaml") else None
+    config_file=config_file
 )
 
 trainer = Seq2SeqTrainer(
@@ -98,7 +110,7 @@ trainer = Seq2SeqTrainer(
     callbacks=[archive_script_callback]
 )
 
-logger.debug(f"Trainer callbacks:{trainer.callback_handler.callback_list}")
+logger.debug("Trainer callbacks: " + trainer.callback_handler.callback_list.replace('\n', ', '))
 # __import__('ipdb').set_trace()
 logger.debug("Start Training!!!")
 trainer.train(resume_from_checkpoint=model_args.checkpoint)
