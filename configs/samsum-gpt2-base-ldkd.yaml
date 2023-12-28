@@ -1,0 +1,40 @@
+# ModelArguments
+model_name_or_path: ../models/gpt2/base/
+torch_dtype: float16
+tokenizer_name: ../models/gpt2/base/
+
+# DataArguments
+dataset_name: samsum
+
+# Seq2SeqTrainingArguments
+output_dir: gpt2-base-sft
+num_train_epochs: 20
+learning_rate: 5e-4  # base 5e-4 xlarge 5e-5
+per_device_train_batch_size: 8
+gradient_accumulation_steps: 2
+per_device_eval_batch_size: 2
+fp16: True
+adam_epsilon: 1e-3
+lr_scheduler_type: cosine
+weight_decay: 1e-2
+optim: adamw_torch
+save_strategy: steps
+evaluation_strategy: steps
+logging_strategy: steps
+eval_steps: 0.5
+save_steps: 0.5
+logging_steps: 0.05
+save_total_limit: 3
+load_best_model_at_end: True
+report_to: tensorboard
+# gradient_checkpointing=True
+ddp_find_unused_parameters: True
+deepspeed: ds_config/ds_config_zero2.json
+
+# KDArguments
+kd_type: ldkd
+kd_args:
+  ldkd_alpha: 1
+  ldkd_beta: 2
+  ldkd_top_ratio: 0.99
+  kd_temperature: 2.5
