@@ -1,11 +1,6 @@
 from dataclasses import dataclass, field
 from typing import Optional
-from src.trainer import Seq2SeqKDArguments, Seq2SeqLDKDArguments
-
-KD_TYPE_DICT = dict(
-    kd = Seq2SeqKDArguments,
-    ldkd = Seq2SeqLDKDArguments
-)
+from src.trainer import KD_ARGS_DICT
 
 @dataclass
 class ModelArguments:
@@ -82,7 +77,7 @@ class KDArguments:
     kd_type: str = field(
         default=None, metadata={
             "help": "Type of the KD trainer.",
-            "choices": list(KD_TYPE_DICT.keys())
+            "choices": list(KD_ARGS_DICT.keys())
         }
     )
     teacher_model_path: Optional[str] = field(
@@ -94,10 +89,13 @@ class KDArguments:
     kd_args: Optional[dict] = field(
         default=None, metadata={"help": "Key-value pairs of the KD arguments."}
     )
+    tensor_parallel: bool = field(
+        default=False
+    )
     
     def __post_init__(self):
         if self.kd_type == None:
             return
         self.kd_type = self.kd_type.lower()
-        assert self.kd_type in KD_TYPE_DICT.keys(), f"Unknown KD trainer type {self.kd_type}."
-        self.kd_args = KD_TYPE_DICT[self.kd_type](**self.kd_args)
+        assert self.kd_type in KD_ARGS_DICT.keys(), f"Unknown KD trainer type {self.kd_type}."
+        self.kd_args = KD_ARGS_DICT[self.kd_type](**self.kd_args)

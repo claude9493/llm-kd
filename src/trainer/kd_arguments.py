@@ -12,3 +12,7 @@ class Seq2SeqLDKDArguments(Seq2SeqKDArguments):
     ldkd_alpha: float = field(default=1.0, metadata={"help":"Weight for top classes"})
     ldkd_beta: float = field(default=1.0, metadata={"help":"Weight for remaining classes"})
     ldkd_top_ratio: float = field(default=0.9, metadata={"help":"Top percentage."})
+
+@dataclass
+class Seq2SeqDataFreeKDArguments(Seq2SeqKDArguments):
+    pass
