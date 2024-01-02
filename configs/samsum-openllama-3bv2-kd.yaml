@@ -1,22 +1,25 @@
 # ModelArguments
-model_name_or_path: ../models/openllama/3Bv2
+model_name_or_path: ../models/openllama/3BV2
 torch_dtype: float16
-tokenizer_name: ../models/openllama/3Bv2
-
+tokenizer_name: ../models/openllama/3BV2
+tokenizer_kwargs:
+  use_fast: False
+  padding_side: right
 # DataArguments
 dataset_name: samsum
 
 # Seq2SeqTrainingArguments
 output_dir: openllama-3bv2-kd
-num_train_epochs: 20
-learning_rate: 5e-4  # base 5e-4 xlarge 5e-5
-per_device_train_batch_size: 8
-gradient_accumulation_steps: 2
+do_eval: false  # Evaluation with tensor parallel is unavailable right now
+num_train_epochs: 5
+learning_rate: 0.0005
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 4
 per_device_eval_batch_size: 2
 fp16: true
-adam_epsilon: 1e-3
+adam_epsilon: 0.001
 lr_scheduler_type: cosine
-weight_decay: 1e-2
+weight_decay: 0.01
 optim: adamw_torch
 save_strategy: steps
 evaluation_strategy: steps
@@ -29,11 +32,13 @@ load_best_model_at_end: true
 report_to: tensorboard
 # gradient_checkpointing=True
 ddp_find_unused_parameters: true
-deepspeed: ds_config/ds_config_zero2.json
+# deepspeed: ds_config/ds_config_zero2.json
+remove_unused_columns: False
 
 # KDArguments
 kd_type: kd
-teacher_model_path: ../models/llama2/7B/
+tensor_parallel: true
+teacher_model_path: ../models/llama2/7B/  # Not a finetuned teacher model
 kd_args:
   reverse_kld: false
   kd_ratio: 0.5

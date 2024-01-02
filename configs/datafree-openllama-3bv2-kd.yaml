@@ -1,0 +1,45 @@
+# ModelArguments
+model_name_or_path: ../models/openllama/3BV2
+torch_dtype: float16
+tokenizer_name: ../models/openllama/3BV2
+tokenizer_kwargs:
+  use_fast: False
+  padding_side: right
+# DataArguments
+dataset_name: datafree
+
+# Seq2SeqTrainingArguments
+output_dir: openllama-3bv2-kd
+do_eval: false
+num_train_epochs: 5
+learning_rate: 0.0005  # Evaluation with tensor parallel is unavailable right now
+per_device_train_batch_size: 2
+gradient_accumulation_steps: 4
+per_device_eval_batch_size: 2
+fp16: true
+adam_epsilon: 0.001
+lr_scheduler_type: cosine
+weight_decay: 0.01
+optim: adamw_torch
+save_strategy: steps
+evaluation_strategy: steps
+logging_strategy: steps
+eval_steps: 0.5
+save_steps: 0.5
+logging_steps: 0.05
+save_total_limit: 3
+load_best_model_at_end: true
+report_to: tensorboard
+# gradient_checkpointing=True
+ddp_find_unused_parameters: true
+# deepspeed: ds_config/ds_config_zero2.json
+remove_unused_columns: False
+
+# KDArguments
+kd_type: kd
+tensor_parallel: true
+teacher_model_path: ../models/llama2/7B/
+kd_args:
+  reverse_kld: false
+  kd_ratio: 1.0  # No training data, only KD loss
+  kd_temperature: 1.0
