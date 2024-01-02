@@ -1,5 +1,6 @@
 from loguru import logger
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
+import tensor_parallel as tp
 
 import torch
 from torch import nn
@@ -81,6 +82,7 @@ class Seq2SeqKDTrainer(Seq2SeqTrainer):
         callbacks: Optional[List["TrainerCallback"]] = None,
         optimizers: Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR] = (None, None),
         preprocess_logits_for_metrics: Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = None,
+        tensor_parallel: bool = False
     ):
         super().__init__(
             model=model,
@@ -98,8 +100,19 @@ class Seq2SeqKDTrainer(Seq2SeqTrainer):
         
         # Load Teacher model
         self.teacher_model = teacher_model
-        self._move_model_to_device(self.teacher_model, args.device)
-        logger.debug(f"Teacher model is moved to device {args.device}")
+
+        # self._move_model_to_device(self.teacher_model, args.device)
+        # logger.debug(f"Teacher model is moved to device {args.device}")
+        self.tensor_parallel = tensor_parallel
+        if tensor_parallel:
+            self.model = tp.tensor_parallel(self.model)
+            self.teacher_model = tp.tensor_parallel(self.teacher_model)
+            print(type(self.model))
+            logger.debug("Student and teacher models are tensor-parallized.")
+        
+        # print(self.model)
+        # print(self.teacher_model)
+        
         self.kd_args = kd_args
         self.loss_dict = dict()
         
@@ -107,6 +120,8 @@ class Seq2SeqKDTrainer(Seq2SeqTrainer):
        
     def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
         """
+        transformers==4.36.2 !!!
+
         Perform a training step on a batch of inputs.
 
         Subclass and override to inject custom behavior.
@@ -123,6 +138,10 @@ class Seq2SeqKDTrainer(Seq2SeqTrainer):
         Return:
             `torch.Tensor`: The tensor with training loss on this batch.
         """
+        print(type(model))
+        if self.tensor_parallel and type(model) != tp.TensorParallelPreTrainedModel:
+            model = tp.tensor_parallel(model)
+        # print(f"Train: {model}")
         model.train()
         inputs = self._prepare_inputs(inputs)
 
@@ -136,9 +155,7 @@ class Seq2SeqKDTrainer(Seq2SeqTrainer):
         if self.args.n_gpu > 1:
             loss = loss.mean()  # mean() to average on multi-gpu parallel training
 
-        if self.do_grad_scaling:
-            self.scaler.scale(loss).backward()
-        elif self.use_apex:
+        if self.use_apex:
             with amp.scale_loss(loss, self.optimizer) as scaled_loss:
                 scaled_loss.backward()
         else:
@@ -156,6 +173,7 @@ class Seq2SeqKDTrainer(Seq2SeqTrainer):
             labels = inputs.pop("labels")
         else:
             labels = None  # Default case: no label smoothing
+        
         outputs = model(**inputs)
         
         # Save past state if it exists
@@ -181,6 +199,7 @@ class Seq2SeqKDTrainer(Seq2SeqTrainer):
             # We don't use .loss here since the model may return tuples instead of ModelOutput.
             loss_sft = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
 
+        # KD !!!
         # __import__('ipdb').set_trace()
         loss_kd = self.compute_kd_loss(model, inputs, outputs)
         kd_ratio = self.kd_args.kd_ratio
@@ -214,7 +233,18 @@ class Seq2SeqKDTrainer(Seq2SeqTrainer):
         # logger.debug(f"loss_kd: {loss_kd.item():.4f}")
         return loss_kd
     
-
+    def prediction_step(
+        self,
+        model: nn.Module,
+        inputs: Dict[str, Union[torch.Tensor, Any]],
+        prediction_loss_only: bool,
+        ignore_keys: Optional[List[str]] = None,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        
+        if self.tensor_parallel and type(model) != tp.TensorParallelPreTrainedModel:
+            model = tp.tensor_parallel(model)
+        print(f"Evaluation: {model}")
+        super().prediction_step(model, inputs, prediction_loss_only, ignore_keys)  #TODO
 
 
 class Seq2SeqLDKDTrainer(Seq2SeqKDTrainer):
@@ -252,3 +282,103 @@ class Seq2SeqLDKDTrainer(Seq2SeqKDTrainer):
         
         loss_kd = alpha * top_kld + beta * remain_kld
         return loss_kd
+
+
+class Seq2SeqDataFreeKDTrainer(Seq2SeqKDTrainer):
+    def __init__(
+        self,
+        model: Union["PreTrainedModel", nn.Module] = None,
+        teacher_model: Union["PreTrainedModel", nn.Module] = None,
+        args: "TrainingArguments" = None,
+        kd_args: "Seq2SeqKDArguments" = None,
+        data_collator: Optional["DataCollator"] = None,
+        train_dataset: Optional[Dataset] = None,
+        eval_dataset: Optional[Union[Dataset, Dict[str, Dataset]]] = None,
+        tokenizer: Optional["PreTrainedTokenizerBase"] = None,
+        model_init: Optional[Callable[[], "PreTrainedModel"]] = None,
+        compute_metrics: Optional[Callable[["EvalPrediction"], Dict]] = None,
+        callbacks: Optional[List["TrainerCallback"]] = None,
+        optimizers: Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR] = (None, None),
+        preprocess_logits_for_metrics: Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = None,
+        tensor_parallel: bool = False
+    ):
+        super().__init__(
+            model=model,
+            teacher_model=teacher_model,
+            args=args,
+            kd_args=kd_args,
+            data_collator=data_collator,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            tokenizer=tokenizer,
+            model_init=model_init,
+            compute_metrics=compute_metrics,
+            callbacks=callbacks,
+            optimizers=optimizers,
+            preprocess_logits_for_metrics=preprocess_logits_for_metrics,
+            tensor_parallel=tensor_parallel
+        )
+    
+    def compute_loss(self, model, inputs, return_outputs=False):
+        """
+        How the loss is computed by Trainer. By default, all models return the loss in the first element.
+
+        Subclass and override for custom behavior.
+        """
+        if self.label_smoother is not None and "labels" in inputs:
+            labels = inputs.pop("labels")
+        else:
+            labels = None  # Default case: no label smoothing
+        
+        # Teacher Generating from Seeding Word
+        pass
+
+        outputs = model(**inputs)
+        
+        if labels is not None:
+            if is_peft_available() and isinstance(model, PeftModel):
+                model_name = unwrap_model(model.base_model)._get_name()
+            else:
+                model_name = unwrap_model(model)._get_name()
+            if model_name in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.values():
+                loss = self.label_smoother(outputs, labels, shift_labels=True)
+            else:
+                loss = self.label_smoother(outputs, labels)
+        else:
+            if isinstance(outputs, dict) and "loss" not in outputs:
+                raise ValueError(
+                    "The model did not return a loss from the inputs, only the following keys: "
+                    f"{','.join(outputs.keys())}. For reference, the inputs it received are {','.join(inputs.keys())}."
+                )
+            # We don't use .loss here since the model may return tuples instead of ModelOutput.
+            loss_sft = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
+
+        # KD !!!
+        # __import__('ipdb').set_trace()
+        loss_kd = self.compute_kd_loss(model, inputs, outputs)
+        kd_ratio = self.kd_args.kd_ratio
+        loss = (1-kd_ratio)* loss_sft + kd_ratio * loss_kd
+        self.loss_dict = dict(
+            loss=round(loss.mean().item(), 4),
+            loss_sft=round(loss_sft.mean().item(), 4),
+            loss_kd=round(loss_kd.mean().item(), 4)
+        )
+        # self.log(self.loss_dict)
+        return (loss, outputs) if return_outputs else loss
+
+    def _prepare_inputs(self, inputs: Dict[str, Union[torch.Tensor, Any]]) -> Dict[str, Union[torch.Tensor, Any]]:
+        """
+        Prepare `inputs` before feeding them to the model, converting them to tensors if they are not already and
+        handling potential state.
+        """
+
+        inputs = self._prepare_input(inputs)
+        if len(inputs) == 0:
+            raise ValueError(
+                "The batch received was empty, your model won't be able to train on it. Double-check that your "
+                f"training dataset contains keys expected by the model: {','.join(self._signature_columns)}."
+            )
+        if self.args.past_index >= 0 and self._past is not None:
+            inputs["mems"] = self._past
+
+        return inputs
