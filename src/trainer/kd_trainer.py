@@ -1,3 +1,4 @@
+from copy import deepcopy
 from loguru import logger
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 import tensor_parallel as tp
@@ -7,7 +8,7 @@ from torch import nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 
-from transformers import Seq2SeqTrainer, TrainerCallback
+from transformers import Seq2SeqTrainer, TrainerCallback, GenerationConfig
 
 from transformers.trainer import (
     is_sagemaker_mp_enabled, 
@@ -100,16 +101,17 @@ class Seq2SeqKDTrainer(Seq2SeqTrainer):
         
         # Load Teacher model
         self.teacher_model = teacher_model
-
-        # self._move_model_to_device(self.teacher_model, args.device)
-        # logger.debug(f"Teacher model is moved to device {args.device}")
         self.tensor_parallel = tensor_parallel
+
         if tensor_parallel:
             self.model = tp.tensor_parallel(self.model)
             self.teacher_model = tp.tensor_parallel(self.teacher_model)
-            print(type(self.model))
+            # print(type(self.model))
             logger.debug("Student and teacher models are tensor-parallized.")
-        
+        else:
+            self._move_model_to_device(self.teacher_model, args.device)
+            self._move_model_to_device(self.model, args.device)
+            logger.debug(f"Models are moved to device {args.device}")
         # print(self.model)
         # print(self.teacher_model)
         
@@ -138,7 +140,7 @@ class Seq2SeqKDTrainer(Seq2SeqTrainer):
         Return:
             `torch.Tensor`: The tensor with training loss on this batch.
         """
-        print(type(model))
+        # print(type(model))
         if self.tensor_parallel and type(model) != tp.TensorParallelPreTrainedModel:
             model = tp.tensor_parallel(model)
         # print(f"Train: {model}")
@@ -198,7 +200,14 @@ class Seq2SeqKDTrainer(Seq2SeqTrainer):
                 )
             # We don't use .loss here since the model may return tuples instead of ModelOutput.
             loss_sft = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
-
+        
+        if self.control.should_evaluate:
+            # Return only loss with labels when evaluate.
+            self.loss_dict = dict(
+                loss=round(loss_sft.mean().item(), 4)
+            )
+            return (loss_sft, outputs) if return_outputs else loss_sft
+        
         # KD !!!
         # __import__('ipdb').set_trace()
         loss_kd = self.compute_kd_loss(model, inputs, outputs)
@@ -243,13 +252,25 @@ class Seq2SeqKDTrainer(Seq2SeqTrainer):
         
         if self.tensor_parallel and type(model) != tp.TensorParallelPreTrainedModel:
             model = tp.tensor_parallel(model)
-        print(f"Evaluation: {model}")
-        super().prediction_step(model, inputs, prediction_loss_only, ignore_keys)  #TODO
+        # print(f"Evaluation: {model}")
+        return super().prediction_step(model, inputs, prediction_loss_only, ignore_keys)  #TODO
 
+    def _wrap_model(self, model, training=True, dataloader=None):
+        # Overwrite the _wrap_model method
+        # Also comment the parts in transformers.trainer.evaluation_loop
+        if self.tensor_parallel:
+            return model
+        else:
+            return super()._wrap_model(model, training, dataloader)
 
 class Seq2SeqLDKDTrainer(Seq2SeqKDTrainer):
     
-    def compute_kd_loss(self, model, inputs, outputs=None):
+    def compute_kd_loss(self, model, inputs, outputs=None, gen=True):
+        if gen and torch.rand(1) < self.kd_args.ldkd_gen_perc:
+            try:
+                self.compute_gen_kd_loss(model, inputs)
+            except:
+                pass
         assert outputs, "Give me student model's outputs."
         tmpt = self.kd_args.kd_temperature
         alpha, beta = self.kd_args.ldkd_alpha, self.kd_args.ldkd_beta
@@ -267,7 +288,7 @@ class Seq2SeqLDKDTrainer(Seq2SeqKDTrainer):
         logits_s = torch.gather(outputs['logits'], 2, idx)
         
         top_mask = (torch.cumsum(F.softmax(logits_t, dim=-1), dim=-1) < top_ratio)
-        top_mask[:,1] = True
+        top_mask[0,:,0] = True
         
         input, target = logits_s, logits_t
         if self.kd_args.reverse_kld:
@@ -280,8 +301,53 @@ class Seq2SeqLDKDTrainer(Seq2SeqKDTrainer):
         top_kld = (kld * top_mask / loss_mask.sum(1, keepdim=True)).view(len(input),-1).nansum(-1).mean()
         remain_kld = (kld * (~top_mask) / loss_mask.sum(1, keepdim=True)).view(len(input),-1).nansum(-1).mean()
         
-        loss_kd = alpha * top_kld + beta * remain_kld
+        loss_kd = (alpha * top_kld + beta * remain_kld) / (alpha + beta)
         return loss_kd
+
+    def compute_gen_kd_loss(self, model, inputs):
+        bs = inputs['input_ids'].size(0)
+        inputs_for_gen = [dict() for _ in range(bs)]
+        # 1. Dict of tensor to list of dict of tensor
+        for k, vs in inputs.items():
+            for ifg, v in zip(inputs_for_gen, vs):
+                ifg[k] = deepcopy(v)
+        # 2. Remove padding and gt output
+        for ifg in inputs_for_gen:
+            len_padding = sum(ifg['attention_mask']==0)
+            len_output = sum(ifg['labels'][len_padding:]!=-100)
+            for k, v in ifg.items():
+                ifg[k] = v[len_padding:-len_output]
+            ifg.pop('labels', None)
+        # 3. Padding
+        inputs_for_gen = self._prepare_input(self.tokenizer.pad(inputs_for_gen, padding=True))
+        # 4. Student generation
+        with torch.no_grad():
+            student_gens = self.model.generate(**inputs_for_gen, max_new_tokens=256)  # To-Do: max_new_tokens to generate as a hyper-parameter
+        # 5. Teacher-assisted generation
+        # 5.1 Find loctions modifying from
+        inputs2 = self._prepare_input(self.tokenizer(self.tokenizer.batch_decode(student_gens), padding=True, add_special_tokens=False, return_tensors='pt'))
+        logits_t = self.teacher_model(**inputs2).logits
+        loss_t = torch.nn.functional.cross_entropy(torch.transpose(logits_t,1,2), student_gens, reduction='none')
+        max_ce_loc = loss_t[:, inputs_for_gen['input_ids'].size(1):].argmax(1) + inputs_for_gen['input_ids'].size(1)
+        # 5.2 Prepare inputs for generation
+        inputs_for_gen_t = [dict() for _ in range(bs)]
+        for i, ifg in enumerate(inputs_for_gen_t):
+            for k, v in inputs2.items():
+                ifg[k] = v[i][:max_ce_loc[i]]
+        inputs_for_gen_t = self._prepare_input(self.tokenizer.pad(inputs_for_gen_t, padding=True))
+        # 5.3 Teacher generate
+        with torch.no_grad():
+            teacher_gens = self.teacher_model.generate(**inputs_for_gen_t, max_new_tokens=256)
+        inputs3 = self._prepare_input(self.tokenizer(self.tokenizer.batch_decode(teacher_gens, skip_special_tokens=True), padding=True, add_special_tokens=True, return_tensors='pt'))
+        inputs3['labels'] = deepcopy(inputs3['input_ids'])
+        for i in range(bs):
+            len_padding = int(sum(inputs3['attention_mask'][i]==0))
+            len_prompt = int(sum(inputs['labels'][i] == -100))
+            inputs3['labels'][i][len_padding:len_padding+len_prompt] = -100
+        del inputs_for_gen, student_gens, inputs2, logits_t, inputs_for_gen_t, teacher_gens
+        # 6. Compute loss
+        return self.compute_kd_loss(model, inputs3, outputs=self.model(**inputs3), gen=False)
+        # __import__('ipdb').set_trace()
 
 
 class Seq2SeqDataFreeKDTrainer(Seq2SeqKDTrainer):
@@ -331,10 +397,27 @@ class Seq2SeqDataFreeKDTrainer(Seq2SeqKDTrainer):
             labels = None  # Default case: no label smoothing
         
         # Teacher Generating from Seeding Word
-        pass
-
-        outputs = model(**inputs)
-        
+        generation_config = GenerationConfig(
+            do_sample=True,
+            top_p=1.5,
+            top_k= 3,
+            temperature=1.0,
+            no_repeat_ngram_size=6,
+            # repetition_penalty=None,
+            max_length=512,
+            # max_new_token=256,
+            min_length=None,
+            eos_token_id=self.tokenizer.eos_token_id,
+            pad_token_id=self.tokenizer.pad_token_id,
+            return_dict_in_generate=False,
+            output_scores=True,
+            num_return_sequences=self.kd_args.seqs_per_seed
+        )
+        data = self.teacher_model.generate(**inputs, generation_config=generation_config)
+        data = {'input_ids': data, 'labels':data}
+        # logger.debug("Generation done.")
+        outputs = model(**data)
+        # logger.debug(f"Forward propagation done. Loss = {outputs.loss}")
         if labels is not None:
             if is_peft_available() and isinstance(model, PeftModel):
                 model_name = unwrap_model(model.base_model)._get_name()
@@ -348,14 +431,15 @@ class Seq2SeqDataFreeKDTrainer(Seq2SeqKDTrainer):
             if isinstance(outputs, dict) and "loss" not in outputs:
                 raise ValueError(
                     "The model did not return a loss from the inputs, only the following keys: "
-                    f"{','.join(outputs.keys())}. For reference, the inputs it received are {','.join(inputs.keys())}."
+                    f"{','.join(outputs.keys())}. For reference, the inputs it received are {','.join(data.keys())}."
                 )
             # We don't use .loss here since the model may return tuples instead of ModelOutput.
             loss_sft = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
 
         # KD !!!
         # __import__('ipdb').set_trace()
-        loss_kd = self.compute_kd_loss(model, inputs, outputs)
+        # logger.debug("Computing kd loss...")
+        loss_kd = self.compute_kd_loss(model, data, outputs)
         kd_ratio = self.kd_args.kd_ratio
         loss = (1-kd_ratio)* loss_sft + kd_ratio * loss_kd
         self.loss_dict = dict(
@@ -371,6 +455,8 @@ class Seq2SeqDataFreeKDTrainer(Seq2SeqKDTrainer):
         Prepare `inputs` before feeding them to the model, converting them to tensors if they are not already and
         handling potential state.
         """
+        # print(inputs)
+        inputs = self.tokenizer(self.tokenizer.batch_decode(inputs['seeds'].reshape(-1,1)), return_tensors='pt', padding=True)
 
         inputs = self._prepare_input(inputs)
         if len(inputs) == 0:
