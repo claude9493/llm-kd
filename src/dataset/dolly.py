@@ -8,17 +8,19 @@ from .base import generate_and_tokenize_prompt, columns, DataInfo
 
 NAME = "Dolly"
 
-prompt_template = (
-    "Below is an instruction that describes a task, paired with an input that provides further context. "
-    "Write a response that appropriately completes the request.\n\n"
-    "### Instruction:\n{instruction}\n\n### Input:\n{context}\n\n### Response:\n{response}"
-)
+# prompt_template = (
+#     "Below is an instruction that describes a task, paired with an input that provides further context. "
+#     "Write a response that appropriately completes the request.\n\n"
+#     "### Instruction:\n{instruction}\n\n### Input:\n{context}\n\n### Response:\n{response}"
+# )
 
-prompt_template2 = (  # No context
-    "Below is an instruction that describes a task. "
-    "Write a response that appropriately completes the request.\n\n"
-    "### Instruction:\n{instruction}\n\n### Response:\n{response}"
-)
+# prompt_template2 = (  # No context
+#     "Below is an instruction that describes a task. "
+#     "Write a response that appropriately completes the request.\n\n"
+#     "### Instruction:\n{instruction}\n\n### Response:\n{response}"
+# )
+
+prompt_template = "{text}"
 
 info = DataInfo(
     name="dolly",
@@ -29,14 +31,14 @@ info = DataInfo(
     cutoff_len=512
 )
 
-info2 = DataInfo(
-    name="dolly",
-    path=Path("./data/dolly"),
-    prompt_template=prompt_template2,
-    label_split="### Response:\n",
-    label_column="response",
-    cutoff_len=512
-)
+# info2 = DataInfo(
+#     name="dolly",
+#     path=Path("./data/dolly"),
+#     prompt_template=prompt_template2,
+#     label_split="### Response:\n",
+#     label_column="response",
+#     cutoff_len=512
+# )
 
 # generate_and_tokenize_prompt = partial(generate_and_tokenize_prompt, info=info)
 
@@ -45,10 +47,7 @@ logger.debug(f"Dataset: {dataset}")
 
 def get_train(tokenizer):
     gtp = partial(generate_and_tokenize_prompt, info=info, tokenizer=tokenizer)
-    gtp2 = partial(generate_and_tokenize_prompt, info=info2, tokenizer=tokenizer)
-    train_data = concatenate_datasets([
-        dataset['train'].filter(lambda x: len(x['context'])!=0).map(gtp, num_proc=1),
-        dataset['train'].filter(lambda x: len(x['context'])==0).map(gtp2, num_proc=1)]) \
+    train_data = dataset['train'].map(gtp, num_proc=1) \
             .filter(lambda instance: instance['is_label_complete']) \
             .select_columns(columns) \
             .with_format(type='torch')
@@ -58,10 +57,7 @@ def get_train(tokenizer):
 
 def get_val(tokenizer):
     gtp = partial(generate_and_tokenize_prompt, info=info, tokenizer=tokenizer)
-    gtp2 = partial(generate_and_tokenize_prompt, info=info2, tokenizer=tokenizer)
-    val_data = concatenate_datasets([
-        dataset['validation'].filter(lambda x: len(x['context'])!=0).map(gtp, num_proc=1),
-        dataset['validation'].filter(lambda x: len(x['context'])==0).map(gtp2, num_proc=1)]) \
+    val_data = dataset['validation'].map(gtp, num_proc=1) \
             .filter(lambda instance: instance['is_label_complete']) \
             .select_columns(columns) \
             .with_format(type='torch')
@@ -70,16 +66,13 @@ def get_val(tokenizer):
 
 def get_test(tokenizer):
     columns_test = deepcopy(columns)
-    columns_test.append('_id')
+    columns_test.append('id')
     gtp = partial(generate_and_tokenize_prompt, info=info, tokenizer=tokenizer, is_test=True)
-    gtp2 = partial(generate_and_tokenize_prompt, info=info2, tokenizer=tokenizer, is_test=True)
     if 'id' not in dataset['test'].column_names:
         dataset['test'] = dataset['test'].add_column('id', list(range(dataset['test'].num_rows)))
-    test_data = concatenate_datasets([
-        dataset['test'].filter(lambda x: len(x['context'])!=0).map(gtp, num_proc=1),
-        dataset['test'].filter(lambda x: len(x['context'])==0).map(gtp2, num_proc=1)]) \
+    test_data = dataset['test'].map(gtp, num_proc=1) \
             .select_columns(columns_test) \
-            .with_format(type='torch', columns=columns_test)
+            .with_format(type='torch', columns=columns, output_all_columns=True)
 
     logger.debug(f"Testing data usage: {test_data.num_rows}/{dataset['validation'].num_rows}.")      
     return test_data

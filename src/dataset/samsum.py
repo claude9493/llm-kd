@@ -22,7 +22,7 @@ Summary:
 
 info = DataInfo(
     name="Samsum",
-    path=Path("./data/samsum"),
+    path="./data/samsum",
     prompt_template=prompt_template,
     label_split="Summary:\n",
     label_column="summary",
@@ -54,9 +54,9 @@ def get_val(tokenizer):
 
 def get_test(tokenizer):
     columns_test = deepcopy(columns)
-    columns_test.append('_id')
+    columns_test.append('id')
     test_data = dataset['test'].map(partial(generate_and_tokenize_prompt, tokenizer=tokenizer, is_test=True), num_proc=1) \
                           .select_columns(columns_test) \
-                          .with_format(type='torch', columns=columns_test)
+                          .with_format(type='torch', columns=columns, output_all_columns=True)
     logger.debug(f"Test data usage: {test_data.num_rows}/{dataset['test'].num_rows}.")      
     return test_data

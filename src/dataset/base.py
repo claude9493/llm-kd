@@ -31,7 +31,9 @@ def generate_and_tokenize_prompt(instance, tokenizer, info, is_test=False):
         result['labels'] = result['input_ids'].copy()
         return result
     tokenized_full_prompt = tokenize(info.prompt_template.format(**instance))
-    tokenized_user_prompt = tokenize(info.prompt_template.format(**instance).split(info.label_split)[0] + info.label_split, add_eos_token=False)
+    # print(info.label_split.join(info.prompt_template.format(**instance).split(info.label_split)[:-1]) + info.label_split)
+    tokenized_user_prompt = tokenize(info.label_split.join(info.prompt_template.format(**instance).split(info.label_split)[:-1])  # In case there are few-shot prompts
+                                      + info.label_split, add_eos_token=False)
     user_prompt_len = len(tokenized_user_prompt['input_ids'])
     tokenized_full_prompt['labels'] = [-100]*user_prompt_len + tokenized_full_prompt['labels'][user_prompt_len:]
     if is_test:
