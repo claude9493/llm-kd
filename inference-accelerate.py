@@ -95,7 +95,7 @@ data_collator = idCollator(
     pad_to_multiple_of=8
 )
 
-dataloader = DataLoader(test_data, collate_fn=data_collator, batch_size=2)
+dataloader = DataLoader(test_data, collate_fn=data_collator, batch_size=96)
 
 generation_config = GenerationConfig(
     # do_sample=True,
@@ -139,13 +139,14 @@ if accelerator.is_main_process:
     timediff=time.time()-start
 
     print(f"time: {timediff}")
-
+    dataset = _data_class.dataset['test']
+    id_type = str if dataset.features['id'].dtype=='string' else int
     predictions = []
 
     for result in tqdm(results_gathered):
         if LABEL_SPLIT in result[label_column]:
             predictions.append({
-                'id': int(result['id']),
+                'id': id_type(result['id']),
                 label_column: result[label_column].replace(tokenizer.pad_token,'').replace(tokenizer.unk_token,'').split(LABEL_SPLIT)[-1]
             })
 
@@ -155,7 +156,6 @@ if accelerator.is_main_process:
         json.dump(predictions, f)
 
     # %%
-    dataset = _data_class.dataset['test']
     # __import__('ipdb').set_trace()
 
     pred_ref = pd.merge(
@@ -179,10 +179,10 @@ if accelerator.is_main_process:
             except Exception:
                 ans = -9999
             return ans
-        # print("predictions:")
-        # print(pred_ref[label_column+'_pred'].map(ans_parse))
-        # print("Reference:")
-        # print(pred_ref[label_column+'_ref'].map(ans_parse))
+        print("predictions:")
+        print(pred_ref[label_column+'_pred'].map(ans_parse))
+        print("Reference:")
+        print(pred_ref[label_column+'_ref'].map(ans_parse))
         metrics = acc.compute(predictions=pred_ref[label_column+'_pred'].map(ans_parse), 
                                 references=pred_ref[label_column+'_ref'].map(ans_parse))
 
