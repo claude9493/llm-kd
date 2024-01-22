@@ -263,8 +263,8 @@ class Seq2SeqAltKDTrainer(Seq2SeqTrainer):
     
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
-        self.model.set_adapter(self.adapters[1], requires_grad=False)
+        self.model.set_adapter(self.adapters[1])
         super()._save(output_dir, state_dict)
 
-        self.model.set_adapter(self.adapters[0], requires_grad=False)
+        self.model.set_adapter(self.adapters[0])
         super()._save(os.path.join(output_dir, "adapter-t"), state_dict)
