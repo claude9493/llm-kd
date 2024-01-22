@@ -39,8 +39,9 @@ from .kd_arguments import *
 from .kd_trainer import kld_loss
 
 class AltKDCallback(TrainerCallback):
-    def __init__(self, switch_freq) -> None:
+    def __init__(self, switch_freq, trainer) -> None:
         self.switch_freq = switch_freq
+        self.trainer = trainer
         super().__init__()
         
     def on_epoch_begin(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
@@ -50,6 +51,22 @@ class AltKDCallback(TrainerCallback):
             logger.debug(f"Epoch: {state.epoch}. Training state: {control.train_state}")
         return super().on_epoch_begin(args, state, control, **kwargs)
     
+    def on_train_begin(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+        params = []
+        for name, param in self.trainer.model.named_parameters():
+            if "adapter" in name:
+                params.append(param)
+                self.trainer.optimizer.param_groups[0]['params'].append(param)
+        # self.trainer.optimizer.param_groups.append({"params": params})
+
+        return super().on_train_begin(args, state, control, **kwargs)
+
+def list_trainable_parameters(model):
+    trainable_params = []
+    for name, param in model.named_parameters():
+        if param.requires_grad == True:
+            trainable_params.append(name)
+    return trainable_params
 
 class Seq2SeqAltKDTrainer(Seq2SeqTrainer):
     def __init__(
@@ -69,7 +86,7 @@ class Seq2SeqAltKDTrainer(Seq2SeqTrainer):
         preprocess_logits_for_metrics: Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = None,
         tensor_parallel: bool = False
     ):
-        self.adapters = ("adapter1", "adapter2")  # (sft, kd)
+        self.adapters = ("adapter-0", "adapter-1")  # (sft, kd)
 
         adapter_config = LoraConfig(**kd_args.altkd_adapter_config)
         model = self._setup_adapters(model, adapter_config)
@@ -103,24 +120,42 @@ class Seq2SeqAltKDTrainer(Seq2SeqTrainer):
         self.loss_dict = dict()
         
         self.control.train_state = "sft"  # (sft, kd)
-        self.add_callback(AltKDCallback(kd_args.altkd_switch_freq))
+        self.add_callback(AltKDCallback(kd_args.altkd_switch_freq, self))
 
     def _setup_adapters(self, model: Module, adapter_config: PeftConfig):
         assert len(self.adapters) == 2, "Only support 2 adapters' alternative KD right now."
         # model = prepare_model_for_kbit_training(model)
-        model = get_peft_model(prepare_model_for_kbit_training(model), adapter_config, adapter_name=self.adapters[0])
-        # for name in self.adapters:
-            # model.add_adapter(adapter_name=name, adapter_config=adapter_config)
-        model.add_adapter(self.adapters[1], adapter_config)
-        # model.enable_adapters()
-        model.set_adapter(self.adapters[0])
-        logger.debug(f"{model.peft_config}")
+        model = get_peft_model(prepare_model_for_kbit_training(model), adapter_config, adapter_name=self.adapters[0])#, mixed=True)
         trainable_params, all_param = model.get_nb_trainable_parameters()
-        logger.debug(f"trainable params: {trainable_params:,d} || all params: {all_param:,d} || trainable%: {100 * trainable_params / all_param}")
+        logger.debug(f"trainable params for {self.adapters[1]}: {trainable_params:,d} || all params: {all_param:,d} || trainable%: {100 * trainable_params / all_param}")
+        # logger.debug(f"{list_trainable_parameters(model)}")
+
+        model.add_adapter(self.adapters[1], adapter_config)
+        self.set_adapter(model, self.adapters[1])
+        trainable_params, all_param = model.get_nb_trainable_parameters()
+        logger.debug(f"trainable params for {self.adapters[1]}: {trainable_params:,d} || all params: {all_param:,d} || trainable%: {100 * trainable_params / all_param}")
+        # logger.debug(f"{list_trainable_parameters(model)}")
+        
+        logger.debug(f"{model.peft_config}")
+        # model.enable_adapters()
+        self.set_adapter(model, self.adapters[0])
+
         return model
     
+    def set_adapter(self, model, adapter, requires_grad=True):
+        # logger.debug(f"Active adapters before set_adapter: {model.active_adapters}")
+        unwrap_model(model).disable_adapter()
+        unwrap_model(model).set_adapter(adapter)
+        if requires_grad:
+            for name, param in model.named_parameters():
+                if adapter in name:
+                    param.requires_grad = True
+        # logger.debug(f"Active adapters after set_adapter: {model.active_adapters}")
+
+
     def training_step(self, model: Module, inputs: Dict[str, Tensor | Any]) -> Tensor:
         model.train()
+        # logger.debug(self.optimizer.param_groups)
         inputs = self._prepare_inputs(inputs)
 
         with self.compute_loss_context_manager():
@@ -128,13 +163,16 @@ class Seq2SeqAltKDTrainer(Seq2SeqTrainer):
 
         if self.args.n_gpu > 1:
             loss = loss.mean()  # mean() to average on multi-gpu parallel training
+        
+        # if self.state.is_world_process_zero:
+        #     logger.debug(f"{list_trainable_parameters(model)[:2]}")
 
         if self.use_apex:
             with amp.scale_loss(loss, self.optimizer) as scaled_loss:
                 scaled_loss.backward()
         else:
             self.accelerator.backward(loss)
-
+        
         return loss.detach() / self.args.gradient_accumulation_steps
     
     def compute_loss(self, model, inputs, return_outputs=False):
@@ -142,7 +180,8 @@ class Seq2SeqAltKDTrainer(Seq2SeqTrainer):
             return self.compute_eval_loss(model, inputs, return_outputs)
         train_state = self.control.train_state
         
-        model.set_adapter(self.adapters[0])  # Teacher
+        # unwrap_model(model).set_adapter(self.adapters[0])  # Teacher
+        self.set_adapter(model, self.adapters[0])
 
         if train_state == "sft":
             outputs = model(**inputs)
@@ -156,10 +195,14 @@ class Seq2SeqAltKDTrainer(Seq2SeqTrainer):
             with torch.no_grad():
                 outputs_t = model(**inputs)
             logits_t = outputs_t['logits']
-            # logger.debug("Teacher logits computed.")
 
-            model.set_adapter(self.adapters[1])  # Student
+            # unwrap_model(model).set_adapter(self.adapters[1])  # Student
+            self.set_adapter(model, self.adapters[1])
+
+            # unwrap_model(model).enable_adapters()
+            model.train()
             outputs = model(**inputs)
+            # logger.debug(f"{list_trainable_parameters(model)[:10]}")
             loss_gt = outputs['loss'] if isinstance(outputs, dict) else outputs[0]
             # logger.debug("Student logits computed.")
 
@@ -175,14 +218,15 @@ class Seq2SeqAltKDTrainer(Seq2SeqTrainer):
 
             loss = (1 - kd_ratio) * loss_gt + kd_ratio * loss_kd
         else:
-            raise ValueError(f"Non-recognized training state {train_state}")
+            raise ValueError(f"Non-identified training state {train_state}")
         
         # Loss dict
         self.loss_dict["loss"] = round(loss.mean().item(), 4)
+        
         if train_state == "kd":
             self.loss_dict["loss_gt"] = round(loss_gt.mean().item(), 4)
             self.loss_dict["loss_kd"] = round(loss_kd.mean().item(), 4)
-
+        
         return (loss, outputs) if return_outputs else loss
     
 
@@ -191,10 +235,15 @@ class Seq2SeqAltKDTrainer(Seq2SeqTrainer):
             adapter = self.adapters[0]
         else:
             adapter = self.adapters[1]
-
-        # adapter = self.adapters[1] if not adapter else adapter
-        model.set_adapter(adapter)
         
+        # unwrap_model(model).set_adapter(adapter)
+        if self.state.is_world_process_zero:
+            logger.debug(f"Global Step: {self.state.global_step}. Eval adapter: {adapter}")
+
+        self.set_adapter(model, adapter, requires_grad=False)
+
+        model.eval()
+        # print(model)
         outputs = model(**inputs)
         
         # Save past state if it exists
@@ -205,7 +254,7 @@ class Seq2SeqAltKDTrainer(Seq2SeqTrainer):
 
         # logger.debug(f"Evaluation outputs: {outputs}")
         loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
-        logger.debug(f"At evaluation, outputs: {outputs}")
+        # logger.debug(f"At evaluation, outputs: {outputs}")
         # loss = outputs.loss
         self.loss_dict = dict(
             loss=round(loss.mean().item(), 4)
@@ -214,8 +263,8 @@ class Seq2SeqAltKDTrainer(Seq2SeqTrainer):
     
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
-        self.model.set_adapter(self.adapters[1])
+        self.model.set_adapter(self.adapters[1], requires_grad=False)
         super()._save(output_dir, state_dict)
 
-        self.model.set_adapter(self.adapters[0])
+        self.model.set_adapter(self.adapters[0], requires_grad=False)
         super()._save(os.path.join(output_dir, "adapter-t"), state_dict)
