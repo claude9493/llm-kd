@@ -32,6 +32,15 @@ info = DataInfo(
 
 generate_and_tokenize_prompt = partial(generate_and_tokenize_prompt, info=info)
 
+# dataset = load_dataset(
+#     "parquet",
+#     data_files=dict(
+#         train="./data/samsum/samsum_train.parquet",
+#         validation="./data/samsum/samsum_validation.parquet",
+#         test="./data/samsum/samsum_test.parquet"
+#     )
+# )
+
 dataset = load_from_disk(info.path)
 logger.debug(f"Dataset: {dataset}")
 
