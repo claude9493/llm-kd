@@ -38,35 +38,38 @@ if TYPE_CHECKING:
 from .kd_arguments import *
 from .kd_trainer import kld_loss
 
-class AltKDCallback(TrainerCallback):
-    def __init__(self, switch_freq, trainer) -> None:
-        self.switch_freq = switch_freq
-        self.trainer = trainer
-        super().__init__()
-        
-    def on_epoch_begin(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
-        if state.epoch > 0 and math.ceil(state.epoch) % self.switch_freq == 0:
-            control.train_state = "kd" if control.train_state == "sft" else "sft"
-        if state.is_world_process_zero:
-            logger.debug(f"Epoch: {state.epoch}. Training state: {control.train_state}")
-        return super().on_epoch_begin(args, state, control, **kwargs)
-    
-    def on_train_begin(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
-        params = []
-        for name, param in self.trainer.model.named_parameters():
-            if "adapter" in name:
-                params.append(param)
-                self.trainer.optimizer.param_groups[0]['params'].append(param)
-        # self.trainer.optimizer.param_groups.append({"params": params})
-
-        return super().on_train_begin(args, state, control, **kwargs)
-
 def list_trainable_parameters(model):
     trainable_params = []
     for name, param in model.named_parameters():
         if param.requires_grad == True:
             trainable_params.append(name)
     return trainable_params
+
+
+class AltKDCallback(TrainerCallback):
+    def __init__(self, switch_freq, trainer) -> None:
+        self.switch_freq = switch_freq
+        self.trainer = trainer
+        super().__init__()
+
+    def on_train_begin(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+        params = []
+        for name, param in self.trainer.model.named_parameters():
+            if "adapter" in name:
+                params.append(param)
+                self.trainer.optimizer.param_groups[0]['params'].append(param)
+        # self.trainer.optimizer.param_groups.append({"params": params})        
+        return super().on_train_begin(args, state, control, **kwargs)
+
+    def on_epoch_begin(self, args: TrainingArguments, state: TrainerState, control: TrainerControl, **kwargs):
+        if state.epoch > 0 and math.ceil(state.epoch) % self.switch_freq == 0:
+            control.train_state = "kd" if control.train_state == "sft" else "sft"
+        if state.is_world_process_zero:
+            logger.debug(f"Epoch: {state.epoch}. Training state: {control.train_state}")
+        # if state.epoch > 1 and control.train_state == "sft":
+            # To-Do: Merge
+        return super().on_epoch_begin(args, state, control, **kwargs)
+
 
 class Seq2SeqAltKDTrainer(Seq2SeqTrainer):
     def __init__(
@@ -121,6 +124,7 @@ class Seq2SeqAltKDTrainer(Seq2SeqTrainer):
         
         self.control.train_state = "sft"  # (sft, kd)
         self.add_callback(AltKDCallback(kd_args.altkd_switch_freq, self))
+        self.do_log_eval_info = True
 
     def _setup_adapters(self, model: Module, adapter_config: PeftConfig):
         assert len(self.adapters) == 2, "Only support 2 adapters' alternative KD right now."
@@ -154,6 +158,7 @@ class Seq2SeqAltKDTrainer(Seq2SeqTrainer):
 
 
     def training_step(self, model: Module, inputs: Dict[str, Tensor | Any]) -> Tensor:
+        self.do_log_eval_info = True
         model.train()
         # logger.debug(self.optimizer.param_groups)
         inputs = self._prepare_inputs(inputs)
@@ -237,8 +242,9 @@ class Seq2SeqAltKDTrainer(Seq2SeqTrainer):
             adapter = self.adapters[1]
         
         # unwrap_model(model).set_adapter(adapter)
-        if self.state.is_world_process_zero:
+        if self.state.is_world_process_zero and self.do_log_eval_info:
             logger.debug(f"Global Step: {self.state.global_step}. Eval adapter: {adapter}")
+            self.do_log_eval_info = False
 
         self.set_adapter(model, adapter, requires_grad=False)
 
@@ -262,9 +268,9 @@ class Seq2SeqAltKDTrainer(Seq2SeqTrainer):
         return (loss, outputs) if return_outputs else loss
     
 
-    def _save(self, output_dir: Optional[str] = None, state_dict=None):
-        self.model.set_adapter(self.adapters[1])
-        super()._save(output_dir, state_dict)
+    # def _save(self, output_dir: Optional[str] = None, state_dict=None):
+    #     self.model.set_adapter(self.adapters[1])
+    #     super()._save(output_dir, state_dict)
 
-        self.model.set_adapter(self.adapters[0])
-        super()._save(os.path.join(output_dir, "adapter-t"), state_dict)
+    #     self.model.set_adapter(self.adapters[0])
+    #     super()._save(os.path.join(output_dir, "adapter-t"), state_dict)

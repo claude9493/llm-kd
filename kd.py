@@ -52,8 +52,8 @@ logger.debug(f"The padding token id is {tokenizer.pad_token_id}")
 
 
 _data_class = get_dataset(data_args.dataset_name)
-train_data = _data_class.get_train(tokenizer)#.select(list(range(100)))
-val_data = _data_class.get_val(tokenizer)
+train_data = _data_class.get_train(tokenizer)# .select(list(range(200)))
+val_data = _data_class.get_val(tokenizer)# .select(list(range(50)))
 
 print(train_data)
 
@@ -130,7 +130,7 @@ training_args.eval_steps /= training_args.num_train_epochs
 training_args.save_steps /= training_args.num_train_epochs
 training_args.logging_steps /= training_args.num_train_epochs
 logger.debug(f"Evaluation per {training_args.eval_steps} steps. Saving per {training_args.save_steps} steps. Logging per {training_args.logging_steps} steps.")
-# training_args.label_names = ['labels']
+training_args.label_names = ['labels']  # If eval loss is not logged, try uncomment this line
 
 # training_args.eval_steps = 1  # For Debug only
 
